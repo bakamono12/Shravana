@@ -19,7 +19,19 @@ def denoise(raw_wav: str, output_dir: str, job_id: str) -> Tuple[str, List[Tuple
     """
     Returns (clean_wav_path, speech_intervals).
     speech_intervals is a list of (start, end) pairs in seconds where speech is detected.
+    Delegates to the remote GPU worker when REMOTE_GPU_URL is configured.
     """
+    from app.config import settings
+    if settings.REMOTE_GPU_URL:
+        from app.ml.remote_client import RemoteCallError
+        try:
+            from app.ml.remote_proxies import RemoteDenoiser
+            return RemoteDenoiser().denoise(raw_wav, output_dir, job_id)
+        except RemoteCallError as exc:
+            if not settings.REMOTE_GPU_FALLBACK_LOCAL:
+                raise
+            logger.warning(f"Remote denoise failed ({exc}), falling back to local execution")
+
     vocals_wav = _run_demucs(raw_wav, output_dir)
     clean_wav = _run_noisereduce(vocals_wav, str(Path(output_dir) / "clean.wav"))
     speech_intervals = _run_vad(clean_wav)

@@ -32,9 +32,12 @@ dependencies = [
     # ML — install torch separately (CPU build recommended on no-GPU machines)
     "torch>=2.2.0",
     "torchaudio>=2.2.0",
+    "torchvision>=0.17.0",
     "torchcodec",
-    # transformers HEAD required for Qwen3-ASR architecture support
-    "transformers @ git+https://github.com/huggingface/transformers.git",
+    # qwen-asr bundles transformers==4.57.6 which natively supports the
+    # qwen3_asr architecture (Qwen3ASRForConditionalGeneration).
+    # Do NOT pin the git-HEAD transformers here; it lacks qwen3_asr support.
+    "qwen-asr>=0.0.6",
     "huggingface-hub>=0.22.0",
     "tqdm>=4.65.0,<5.0.0",
     "accelerate>=0.27.0",

@@ -1,5 +1,6 @@
 import { Routes, Route } from "react-router-dom";
 import { ThemeToggle } from "./components/ThemeToggle";
+import { ExecutorBadge } from "./components/ExecutorBadge";
 import { Home } from "./pages/Home";
 import { JobDetail } from "./pages/JobDetail";
 import { Headphones } from "lucide-react";
@@ -13,7 +14,10 @@ export default function App() {
             <Headphones size={22} className="text-primary" />
             Shravana
           </a>
-          <ThemeToggle />
+          <div className="flex items-center gap-4">
+            <ExecutorBadge />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

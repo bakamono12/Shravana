@@ -1,11 +1,11 @@
-import { useState, useRef, useCallback } from "react";
-import { Upload, FileAudio, FileVideo, X } from "lucide-react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import { Upload, FileAudio, FileVideo, X, ChevronDown, ChevronUp } from "lucide-react";
 import { cn } from "../lib/utils";
-import { api } from "../lib/api";
+import { api, LangInfo } from "../lib/api";
 import { fmtBytes } from "../lib/utils";
 
 const ACCEPTED = ".mp4,.mkv,.mov,.avi,.webm,.mp3,.wav,.m4a,.flac,.ogg,.aac";
-const LANGS = [
+const SRC_LANGS = [
   { value: "", label: "Auto-detect" },
   { value: "en", label: "English" },
   { value: "hi", label: "Hindi" },
@@ -20,11 +20,22 @@ export function Uploader({ onJobCreated }: Props) {
   const [dragging, setDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [langHint, setLangHint] = useState("");
+  // translation
+  const [targetLang, setTargetLang] = useState("");
+  const [translatorMode, setTranslatorMode] = useState("");
+  const [enableRefinement, setEnableRefinement] = useState(true);
+  const [glossary, setGlossary] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [supportedLangs, setSupportedLangs] = useState<Record<string, LangInfo>>({});
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    api.listLanguages().then(setSupportedLangs).catch(() => {});
+  }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -47,7 +58,11 @@ export function Uploader({ onJobCreated }: Props) {
     // Simulate progress (actual XHR progress would need XMLHttpRequest)
     const fakeInterval = setInterval(() => setProgress((p) => Math.min(p + 5, 90)), 300);
 
-    const { promise, abort } = api.uploadFile(file, langHint || undefined);
+    const { promise, abort } = api.uploadFile(
+      file,
+      langHint || undefined,
+      targetLang ? { targetLanguage: targetLang, translatorMode: translatorMode || undefined, enableRefinement, glossary: glossary || undefined } : undefined,
+    );
     abortRef.current = abort;
 
     try {
@@ -119,40 +134,114 @@ export function Uploader({ onJobCreated }: Props) {
 
       {/* Options + upload */}
       {file && (
-        <div className="mt-4 flex flex-col sm:flex-row gap-3 items-start sm:items-center">
-          <div className="flex items-center gap-2 flex-1">
-            <label className="text-sm text-muted-foreground whitespace-nowrap">Language hint:</label>
-            <select
-              value={langHint}
-              onChange={(e) => setLangHint(e.target.value)}
-              className="flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm"
-              disabled={uploading}
-            >
-              {LANGS.map((l) => (
-                <option key={l.value} value={l.value}>{l.label}</option>
-              ))}
-            </select>
+        <div className="mt-4 flex flex-col gap-3">
+          {/* Row 1: source language hint + translate to */}
+          <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+            <div className="flex items-center gap-2 flex-1">
+              <label className="text-sm text-muted-foreground whitespace-nowrap">Source lang:</label>
+              <select
+                value={langHint}
+                onChange={(e) => setLangHint(e.target.value)}
+                className="flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                disabled={uploading}
+              >
+                {SRC_LANGS.map((l) => (
+                  <option key={l.value} value={l.value}>{l.label}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2 flex-1">
+              <label className="text-sm text-muted-foreground whitespace-nowrap">Translate to:</label>
+              <select
+                value={targetLang}
+                onChange={(e) => setTargetLang(e.target.value)}
+                className="flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                disabled={uploading}
+              >
+                <option value="">No translation</option>
+                {Object.entries(supportedLangs).map(([code, info]) => (
+                  <option key={code} value={code}>{info.name} ({code})</option>
+                ))}
+              </select>
+            </div>
           </div>
 
-          {uploading ? (
-            <div className="flex items-center gap-3 w-full sm:w-auto">
-              <div className="flex-1 sm:w-32 h-2 rounded-full bg-muted overflow-hidden">
-                <div
-                  className="h-full bg-primary transition-all duration-300 rounded-full"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <span className="text-sm text-muted-foreground">{progress}%</span>
-              <button onClick={cancel} className="text-sm text-destructive hover:underline">Cancel</button>
+          {/* Row 2: advanced options toggle */}
+          {targetLang && (
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {showAdvanced ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                Advanced translation options
+              </button>
+              {showAdvanced && (
+                <div className="mt-2 flex flex-col gap-2 pl-1 border-l-2 border-muted ml-1">
+                  <div className="flex items-center gap-3">
+                    <label className="text-sm text-muted-foreground whitespace-nowrap">Translator mode:</label>
+                    <select
+                      value={translatorMode}
+                      onChange={(e) => setTranslatorMode(e.target.value)}
+                      className="rounded-md border border-input bg-background px-2 py-1 text-sm"
+                      disabled={uploading}
+                    >
+                      <option value="">Auto (recommended)</option>
+                      <option value="vlm">VLM / Qwen2.5-VL (video)</option>
+                      <option value="audio">Audio / SeamlessM4T (audio)</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-sm text-muted-foreground whitespace-nowrap">LLM refinement:</label>
+                    <input
+                      type="checkbox"
+                      checked={enableRefinement}
+                      onChange={(e) => setEnableRefinement(e.target.checked)}
+                      className="h-4 w-4"
+                      disabled={uploading}
+                    />
+                    <span className="text-xs text-muted-foreground">Context-aware quality pass (slower)</span>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-sm text-muted-foreground">Glossary (one entry per line: <code>Term</code> or <code>Source=Target</code>):</label>
+                    <textarea
+                      value={glossary}
+                      onChange={(e) => setGlossary(e.target.value)}
+                      placeholder={"SIP\nNifty=Nifty\ndemat"}
+                      rows={3}
+                      className="rounded-md border border-input bg-background px-2 py-1 text-sm font-mono resize-none"
+                      disabled={uploading}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
-          ) : (
-            <button
-              onClick={upload}
-              className="bg-primary text-primary-foreground hover:bg-primary/90 px-5 py-2 rounded-md text-sm font-medium transition-colors"
-            >
-              Transcribe
-            </button>
           )}
+
+          {/* Row 3: progress / submit */}
+          <div className="flex items-center gap-3">
+            {uploading ? (
+              <>
+                <div className="flex-1 h-2 rounded-full bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all duration-300 rounded-full"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+                <span className="text-sm text-muted-foreground">{progress}%</span>
+                <button onClick={cancel} className="text-sm text-destructive hover:underline">Cancel</button>
+              </>
+            ) : (
+              <button
+                onClick={upload}
+                className="bg-primary text-primary-foreground hover:bg-primary/90 px-5 py-2 rounded-md text-sm font-medium transition-colors"
+              >
+                {targetLang ? "Transcribe + Translate" : "Transcribe"}
+              </button>
+            )}
+          </div>
         </div>
       )}
 

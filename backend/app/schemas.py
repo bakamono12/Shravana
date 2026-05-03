@@ -18,6 +18,31 @@ class ChunkOut(BaseModel):
         from_attributes = True
 
 
+class TranslationChunkOut(BaseModel):
+    id: str
+    sequence: int
+    start_time: float
+    end_time: float
+    source_text: str
+    translated_text: Optional[str]
+    speaker_id: Optional[str]
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
+class ContextBundleOut(BaseModel):
+    domain: str
+    format: str
+    source_language: str
+    target_language: str
+    named_entities: list[str]
+    idioms_detected: list[str]
+    scene_description: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class JobOut(BaseModel):
     id: str
     filename: str
@@ -28,6 +53,14 @@ class JobOut(BaseModel):
     language_hint: Optional[str]
     error_message: Optional[str]
     waiting_for_model: Optional[str]
+    # translation
+    translate: bool
+    target_language: Optional[str]
+    translator_mode: Optional[str]
+    enable_refinement: bool
+    translation_status: Optional[str]
+    # executor
+    executor: Optional[str] = "local"
     created_at: datetime
     updated_at: datetime
 
@@ -43,6 +76,7 @@ class SubtitleOut(BaseModel):
     id: str
     job_id: str
     format: str
+    language: Optional[str]
     created_at: datetime
 
     class Config:

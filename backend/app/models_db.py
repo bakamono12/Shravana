@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Float, Integer, DateTime, ForeignKey, Text
+from sqlalchemy import String, Float, Integer, DateTime, ForeignKey, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
@@ -29,10 +29,25 @@ class Job(Base):
     language_hint: Mapped[str | None] = mapped_column(String, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     waiting_for_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    # translation fields
+    translate: Mapped[bool] = mapped_column(Boolean, default=False)
+    target_language: Mapped[str | None] = mapped_column(String, nullable=True)
+    # audio|vlm|none — auto-detected if None
+    translator_mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    enable_refinement: Mapped[bool] = mapped_column(Boolean, default=True)
+    context_bundle_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    glossary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending|context|translating|refining|done|failed|degraded_no_refiner — independent of status
+    translation_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    # local|remote — which executor ran this job
+    executor: Mapped[str] = mapped_column(String, default="local")
+    # snapshot of REMOTE_GPU_URL at job time (for debugging/audit)
+    remote_url_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     chunks: Mapped[list["Chunk"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    translation_chunks: Mapped[list["TranslationChunk"]] = relationship(back_populates="job", cascade="all, delete-orphan")
     subtitles: Mapped[list["Subtitle"]] = relationship(back_populates="job", cascade="all, delete-orphan")
 
 
@@ -52,11 +67,34 @@ class Chunk(Base):
     # pending|processing|done|failed|skipped
     status: Mapped[str] = mapped_column(String, default="pending")
     transcript_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    translation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     job: Mapped["Job"] = relationship(back_populates="chunks")
+
+
+class TranslationChunk(Base):
+    """Semantic translation unit — one or more STT segments grouped by topic/silence/speaker."""
+    __tablename__ = "translation_chunks"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_time: Mapped[float] = mapped_column(Float, nullable=False)
+    end_time: Mapped[float] = mapped_column(Float, nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    first_pass: Mapped[str | None] = mapped_column(Text, nullable=True)
+    translated_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    speaker_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # pending|translating|done|failed
+    status: Mapped[str] = mapped_column(String, default="pending")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    job: Mapped["Job"] = relationship(back_populates="translation_chunks")
 
 
 class Subtitle(Base):
@@ -66,6 +104,8 @@ class Subtitle(Base):
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
     format: Mapped[str] = mapped_column(String, nullable=False)  # srt|vtt|json
     path: Mapped[str] = mapped_column(String, nullable=False)
+    # BCP-47 language code; NULL means source language (legacy rows)
+    language: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     job: Mapped["Job"] = relationship(back_populates="subtitles")

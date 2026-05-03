@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.models_db import Job
 from app.pipeline.audio_extractor import ACCEPTED_EXTENSIONS
+from app.pipeline.translation_languages import is_supported
 from app.schemas import UploadResponse
 import app.storage as storage
 from app.jobs import pipeline_runner
@@ -37,6 +38,10 @@ async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     language_hint: str | None = Form(None),
+    target_language: str | None = Form(None),
+    translator_mode: str | None = Form(None),
+    enable_refinement: bool = Form(True),
+    glossary: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
     raw_name = file.filename or "upload"
@@ -45,7 +50,22 @@ async def upload_file(
     if suffix not in ACCEPTED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type '{suffix}'. Accepted: {', '.join(sorted(ACCEPTED_EXTENSIONS))}")
 
-    job = Job(filename=safe_name, video_path="", language_hint=language_hint)
+    if target_language and not is_supported(target_language):
+        raise HTTPException(400, f"Unsupported target language '{target_language}'. See /api/translation/languages for supported codes.")
+
+    if translator_mode and translator_mode not in ("vlm", "audio"):
+        raise HTTPException(400, "translator_mode must be 'vlm' or 'audio'")
+
+    job = Job(
+        filename=safe_name,
+        video_path="",
+        language_hint=language_hint,
+        translate=bool(target_language),
+        target_language=target_language,
+        translator_mode=translator_mode,
+        enable_refinement=enable_refinement,
+        glossary_json=glossary,
+    )
     db.add(job)
     await db.flush()  # get the generated id
 

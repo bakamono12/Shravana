@@ -1,29 +1,49 @@
-"""Qwen3-ASR — used for language ID (0.6B) and Hindi/code-switch ASR (1.7B)."""
+"""Qwen3-ASR — used for language ID (0.6B) and Hindi/code-switch ASR (1.7B).
+
+Uses the official `qwen-asr` Python package (Qwen3ASRModel) as the backend,
+which bundles the correct transformers fork that understands the `qwen3_asr`
+architecture.  Raw ``AutoModelForSpeechSeq2Seq`` cannot load these checkpoints
+with the standard transformers release.
+"""
 from typing import List
 from app.ml.base import BaseSTTModel, TranscriptSegment, WordTimestamp
 
 
 class QwenASRModel(BaseSTTModel):
     def __init__(self, model_id: str, lid_only: bool = False):
-        self.model_id = model_id
+        self.model_id = model_id  # may be a HF repo id or a local path string
         self.lid_only = lid_only
-        self._processor = None
-        self._model = None
+        self._model = None  # Qwen3ASRModel instance
 
     def load(self) -> None:
-        from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+        from qwen_asr import Qwen3ASRModel
         import torch
-        self._processor = AutoProcessor.from_pretrained(self.model_id)
-        self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
+        from pathlib import Path
+        from app.config import settings
+
+        # Prefer local directory if the model has already been downloaded so we
+        # avoid any network calls.  The downloader places files under
+        # storage/models/<registry_key>/; we derive the key from the repo name.
+        repo_slug = self.model_id.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+        # Map known repo slugs to registry key names used on disk
+        _SLUG_TO_KEY = {
+            "qwen3_asr_0_6b": "qwen_lid",
+            "qwen3_asr_1_7b": "qwen3_asr",
+        }
+        key = _SLUG_TO_KEY.get(repo_slug, repo_slug)
+        local_dir = Path(settings.BASE_DIR / settings.MODELS_DIR) / key
+        load_path = str(local_dir) if local_dir.exists() and any(local_dir.rglob("*.safetensors")) else self.model_id
+
+        self._model = Qwen3ASRModel.from_pretrained(
+            load_path,
+            dtype=torch.float32,
+            device_map="cpu",
+            max_inference_batch_size=1,
+            max_new_tokens=256,
         )
-        self._model.eval()
 
     def detect_language(self, audio_path: str) -> tuple[str, float]:
         """Returns (iso_language_code, confidence). Uses first 10s only."""
-        import torch
         import soundfile as sf
         import numpy as np
 
@@ -31,25 +51,22 @@ class QwenASRModel(BaseSTTModel):
         if sr != 16000:
             import librosa
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-        # Take first 10 seconds
+        # Use first 10 seconds for speed
         audio = audio[: 16000 * 10].astype(np.float32)
 
-        inputs = self._processor(audio, sampling_rate=16000, return_tensors="pt")
-        with torch.no_grad():
-            generated = self._model.generate(
-                **inputs,
-                max_new_tokens=5,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-        # Parse language token from generated ids
-        decoded = self._processor.batch_decode(generated.sequences, skip_special_tokens=False)[0]
-        lang = self._parse_language_token(decoded)
-        confidence = self._estimate_confidence(generated)
-        return lang, confidence
+        results = self._model.transcribe(
+            audio=(audio, 16000),
+            language=None,  # let the model detect
+        )
+        if results:
+            lang = self._normalize_lang(results[0].language or "")
+            # qwen-asr doesn't expose a raw confidence score; use 0.9 as a
+            # conservative high-confidence value when the model returns a lang.
+            confidence = 0.9 if lang else 0.0
+            return lang or "en", confidence
+        return "en", 0.0
 
     def transcribe(self, audio_path: str) -> List[TranscriptSegment]:
-        import torch
         import soundfile as sf
         import numpy as np
 
@@ -59,37 +76,51 @@ class QwenASRModel(BaseSTTModel):
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         audio = audio.astype(np.float32)
 
-        inputs = self._processor(audio, sampling_rate=16000, return_tensors="pt")
-        with torch.no_grad():
-            generated = self._model.generate(**inputs, return_timestamps=True)
-        result = self._processor.batch_decode(generated, output_word_offsets=True, skip_special_tokens=True)
+        results = self._model.transcribe(
+            audio=(audio, 16000),
+            language=None,
+            return_time_stamps=True,
+        )
 
-        segments = []
-        for entry in result:
-            text = entry if isinstance(entry, str) else entry.get("text", "")
-            word_offsets = entry.get("word_offsets", []) if isinstance(entry, dict) else []
-            words = [
-                WordTimestamp(word=w["word"], start=w["start_offset"] / 100.0, end=w["end_offset"] / 100.0)
-                for w in word_offsets
-            ]
-            start = words[0].start if words else 0.0
-            end = words[-1].end if words else 0.0
-            segments.append(TranscriptSegment(text=text, start=start, end=end, words=words, language="hi"))
+        segments: List[TranscriptSegment] = []
+        for res in results:
+            text = res.text or ""
+            lang = self._normalize_lang(res.language or "hi")
+            # time_stamps is a list of dicts/objects when return_time_stamps=True
+            words: List[WordTimestamp] = []
+            ts_list = res.time_stamps or []
+            for ts in ts_list:
+                # qwen-asr returns dicts with keys: word/text, start, end
+                if isinstance(ts, dict):
+                    word = ts.get("word") or ts.get("text", "")
+                    start = float(ts.get("start", 0.0))
+                    end = float(ts.get("end", 0.0))
+                else:
+                    word = getattr(ts, "word", "") or getattr(ts, "text", "")
+                    start = float(getattr(ts, "start", 0.0))
+                    end = float(getattr(ts, "end", 0.0))
+                words.append(WordTimestamp(word=word, start=start, end=end))
+            seg_start = words[0].start if words else 0.0
+            seg_end = words[-1].end if words else 0.0
+            segments.append(
+                TranscriptSegment(text=text, start=seg_start, end=seg_end, words=words, language=lang)
+            )
         return segments
 
     @staticmethod
-    def _parse_language_token(decoded: str) -> str:
-        import re
-        m = re.search(r"<\|([a-z]{2,3})\|>", decoded)
-        return m.group(1) if m else "hi"
-
-    @staticmethod
-    def _estimate_confidence(generated) -> float:
-        try:
-            import torch
-            scores = torch.stack(generated.scores, dim=1)
-            probs = torch.softmax(scores, dim=-1)
-            top_prob = probs.max(dim=-1).values.mean().item()
-            return float(top_prob)
-        except Exception:
-            return 0.5
+    def _normalize_lang(code: str) -> str:
+        """Normalise language name/code to ISO 639-1."""
+        _MAP = {
+            "english": "en",
+            "hindi": "hi",
+            "marathi": "mr",
+            "chinese": "zh",
+            "japanese": "ja",
+            "korean": "ko",
+            "french": "fr",
+            "german": "de",
+            "spanish": "es",
+            "arabic": "ar",
+        }
+        code = code.lower().strip()
+        return _MAP.get(code, code)

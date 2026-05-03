@@ -1,13 +1,13 @@
 import { useParams, Link, useNavigate } from "react-router-dom";
-import { ArrowLeft, RefreshCw, CheckCircle, XCircle, Loader, Clock, AlertCircle, Trash2 } from "lucide-react";
+import { ArrowLeft, RefreshCw, CheckCircle, XCircle, Loader, Clock, AlertCircle, Trash2, Languages, Download } from "lucide-react";
 import { useJob } from "../hooks/useJob";
 import { MediaPreview } from "../components/MediaPreview";
-import { api } from "../lib/api";
+import { api, LangInfo } from "../lib/api";
 import { fmtDate, fmtEta } from "../lib/utils";
 import { cn } from "../lib/utils";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
-const PHASES = ["pending", "extracting", "denoising", "chunking", "processing", "assembling", "done"];
+const PHASES = ["pending", "extracting", "denoising", "chunking", "processing", "translating", "assembling", "done"];
 
 const PHASE_LABELS: Record<string, string> = {
   pending: "Queued",
@@ -15,6 +15,7 @@ const PHASE_LABELS: Record<string, string> = {
   denoising: "Denoising & vocal separation",
   chunking: "Chunking audio",
   processing: "Transcribing",
+  translating: "Translating",
   assembling: "Assembling subtitles",
   done: "Done",
   failed: "Failed",
@@ -69,6 +70,21 @@ export function JobDetail() {
   const { job, error } = useJob(jobId);
   const [retrying, setRetrying] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [translating, setTranslating] = useState(false);
+  const [translateTarget, setTranslateTarget] = useState("");
+  const [supportedLangs, setSupportedLangs] = useState<Record<string, LangInfo>>({});
+
+  useEffect(() => {
+    api.listLanguages().then(setSupportedLangs).catch(() => {});
+  }, []);
+
+  const handleTranslate = async () => {
+    if (!jobId || !translateTarget) return;
+    setTranslating(true);
+    try { await api.translateJob(jobId, translateTarget); } catch (err) {
+      alert(err instanceof Error ? err.message : "Translation request failed");
+    } finally { setTranslating(false); }
+  };
 
   if (error) return (
     <div className="text-destructive">
@@ -170,12 +186,66 @@ export function JobDetail() {
         )}
 
         <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
+          {job.executor && (
+            <div>
+              <span className="text-foreground font-medium">Executor:</span>{" "}
+              <span className={job.executor === "remote" ? "text-green-500" : ""}>
+                {job.executor === "remote" ? "Remote GPU" : "Local"}
+              </span>
+            </div>
+          )}
           {job.detected_language && (
-            <div><span className="text-foreground font-medium">Language:</span> {job.detected_language.toUpperCase()}</div>
+            <div><span className="text-foreground font-medium">Source lang:</span> {job.detected_language.toUpperCase()}</div>
+          )}
+          {job.translate && job.target_language && (
+            <div className="flex items-center gap-1">
+              <Languages size={12} className="text-primary" />
+              <span className="text-foreground font-medium">Translated to:</span> {(supportedLangs[job.target_language]?.name ?? job.target_language)}
+              {job.translator_mode && <span className="ml-1 text-xs bg-muted rounded px-1">{job.translator_mode}</span>}
+            </div>
+          )}
+          {job.translate && job.translation_status && (
+            <div>
+              <span className="text-foreground font-medium">Translation:</span>{" "}
+              <span className={cn(
+                job.translation_status === "done" && "text-green-600 dark:text-green-400",
+                job.translation_status === "failed" && "text-destructive",
+              )}>{job.translation_status}</span>
+            </div>
           )}
           <div><span className="text-foreground font-medium">Created:</span> {fmtDate(job.created_at)}</div>
           <div><span className="text-foreground font-medium">Updated:</span> {fmtDate(job.updated_at)}</div>
         </div>
+
+        {/* Subtitle downloads */}
+        {job.status === "done" && jobId && (
+          <div className="flex flex-wrap gap-2 pt-1">
+            {/* Source language downloads */}
+            {(["srt", "vtt"] as const).map((fmt) => (
+              <a
+                key={`src-${fmt}`}
+                href={`/api/subtitles/${jobId}/${fmt}${job.detected_language ? `?lang=${job.detected_language}` : ""}`}
+                download
+                className="flex items-center gap-1 text-xs border border-input rounded px-2 py-1 hover:bg-muted transition-colors"
+              >
+                <Download size={12} /> {fmt.toUpperCase()}{job.detected_language ? ` (${job.detected_language.toUpperCase()})` : ""}
+              </a>
+            ))}
+            {/* Translated language downloads */}
+            {job.translate && job.target_language && job.translation_status === "done" && (
+              (["srt", "vtt"] as const).map((fmt) => (
+                <a
+                  key={`tl-${fmt}`}
+                  href={`/api/subtitles/${jobId}/${fmt}?lang=${job.target_language}`}
+                  download
+                  className="flex items-center gap-1 text-xs border border-primary/40 rounded px-2 py-1 hover:bg-primary/5 transition-colors text-primary"
+                >
+                  <Download size={12} /> {fmt.toUpperCase()} ({(supportedLangs[job.target_language!]?.name ?? job.target_language!).slice(0, 6)})
+                </a>
+              ))
+            )}
+          </div>
+        )}
 
         {job.status === "failed" && job.error_message && (
           <div className="rounded-md bg-destructive/10 border border-destructive/20 px-3 py-2 text-sm text-destructive">
@@ -192,6 +262,36 @@ export function JobDetail() {
       {/* Media + subtitle preview */}
       {job.status === "done" && jobId && (
         <MediaPreview jobId={jobId} detectedLanguage={job.detected_language} />
+      )}
+
+      {/* Retro-translate panel */}
+      {job.status === "done" && jobId && (
+        <div className="bg-card border rounded-xl p-4 space-y-3">
+          <h3 className="text-sm font-medium flex items-center gap-2">
+            <Languages size={16} className="text-primary" />
+            Add / re-run translation
+          </h3>
+          <div className="flex items-center gap-3 flex-wrap">
+            <select
+              value={translateTarget}
+              onChange={(e) => setTranslateTarget(e.target.value)}
+              className="rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+              disabled={translating}
+            >
+              <option value="">Select target language…</option>
+              {Object.entries(supportedLangs).map(([code, info]) => (
+                <option key={code} value={code}>{info.name} ({code})</option>
+              ))}
+            </select>
+            <button
+              onClick={handleTranslate}
+              disabled={!translateTarget || translating}
+              className="flex items-center gap-1 bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-1.5 rounded-md text-sm font-medium transition-colors disabled:opacity-50"
+            >
+              {translating ? <><Loader size={14} className="animate-spin" /> Translating…</> : "Translate"}
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Chunks detail */}

@@ -8,13 +8,20 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.db import init_db
 from app.ml.downloader import start_background_downloads
-from app.routes import upload, jobs, subtitles, models_admin, ws
+from app.routes import upload, jobs, subtitles, models_admin, ws, translation, system
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await start_background_downloads()
+
+    from app.config import settings
+    if settings.REMOTE_GPU_URL:
+        from app.services.remote_health import start_health_poller
+        import asyncio
+        asyncio.create_task(start_health_poller())
+
     yield
 
 
@@ -33,6 +40,8 @@ app.include_router(jobs.router, prefix="/api")
 app.include_router(subtitles.router, prefix="/api")
 app.include_router(models_admin.router, prefix="/api")
 app.include_router(ws.router, prefix="/api")
+app.include_router(translation.router, prefix="/api")
+app.include_router(system.router, prefix="/api")
 
 
 @app.get("/api/health")
