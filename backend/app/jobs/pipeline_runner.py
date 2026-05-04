@@ -94,7 +94,8 @@ async def _run_pipeline(session, job: Job) -> None:
 
     # Stamp executor mode so the UI can show Local / Remote
     from app.config import settings as _cfg
-    executor = "remote" if _cfg.REMOTE_GPU_URL else "local"
+    from app.services.executor_pref import resolve_executor
+    executor = resolve_executor()
     job.executor = executor
     job.remote_url_snapshot = _cfg.REMOTE_GPU_URL or None
     await session.commit()
@@ -111,16 +112,52 @@ async def _run_pipeline(session, job: Job) -> None:
     job.audio_path = raw_wav
     await session.commit()
 
+    # --- Delegate phases 2-7 to the remote GPU worker when configured --------
+    if executor == "remote":
+        from app.jobs.remote_pipeline import run_remote_pipeline, RemotePipelineError
+        try:
+            await run_remote_pipeline(session, job, raw_wav)
+            return
+        except RemotePipelineError as exc:
+            if not settings.REMOTE_GPU_FALLBACK_LOCAL or exc.received_any_event:
+                job.status = "failed"
+                job.error_message = str(exc)
+                job.executor = "remote"
+                await session.commit()
+                await _emit_progress(job)
+                return
+            logger.warning(f"Remote pipeline unavailable ({exc}), running locally")
+            job.executor = "local"
+            await session.commit()
+    # --------------------------------------------------------------------------
+
     # Phase 2: Denoise
     await _update_job(session, job, status="denoising")
     from app.pipeline.denoiser import denoise, is_chunk_silent
     job_dir = str(storage.job_dir(job.id))
-    clean_wav, speech_intervals = await loop.run_in_executor(None, denoise, raw_wav, job_dir, job.id)
+
+    def _denoise_progress(subphase: str, pct: int) -> None:
+        asyncio.run_coroutine_threadsafe(
+            publish_job_progress(job.id, {
+                "job_id": job.id, "status": "denoising", "phase": "denoise",
+                "subphase": subphase, "percent": pct,
+                "stage_index": 2, "stage_total": 6,
+            }),
+            loop,
+        )
+
+    clean_wav, speech_intervals = await loop.run_in_executor(
+        None, denoise, raw_wav, job_dir, job.id, _denoise_progress
+    )
     job.clean_audio_path = clean_wav
     await session.commit()
 
     # Phase 3: Chunk
     await _update_job(session, job, status="chunking")
+    await publish_job_progress(job.id, {
+        "job_id": job.id, "status": "chunking", "phase": "chunk",
+        "percent": 0, "stage_index": 3, "stage_total": 6,
+    })
     from app.pipeline.chunker import chunk_audio
     chunks_dir = str(storage.chunks_dir(job.id))
     manifest = await loop.run_in_executor(None, chunk_audio, clean_wav, chunks_dir)
@@ -141,7 +178,11 @@ async def _run_pipeline(session, job: Job) -> None:
     job.total_chunks = len(manifest)
     job.completed_chunks = sum(1 for e in manifest if is_chunk_silent(e.start_time, e.end_time, speech_intervals))
     await session.commit()
-    await _emit_progress(job)
+    await publish_job_progress(job.id, {
+        "job_id": job.id, "status": "chunking", "phase": "chunk",
+        "percent": 100, "stage_index": 3, "stage_total": 6,
+        "total_chunks": job.total_chunks,
+    })
 
     # Phase 4-5: Detect language + transcribe each chunk
     await _update_job(session, job, status="processing")
@@ -195,6 +236,7 @@ async def _run_pipeline(session, job: Job) -> None:
             "completed_chunks": job.completed_chunks,
             "percent": int(job.completed_chunks / job.total_chunks * 100) if job.total_chunks else 0,
             "eta_seconds": eta,
+            "stage_index": 4, "stage_total": 6,
         })
 
     # Phase 5.5: Context-aware translation (no-op when translate=False)
@@ -204,6 +246,10 @@ async def _run_pipeline(session, job: Job) -> None:
 
     # Phase 6: Reassemble (source language subtitles)
     await _update_job(session, job, status="assembling")
+    await publish_job_progress(job.id, {
+        "job_id": job.id, "status": "assembling", "phase": "assemble",
+        "percent": 0, "stage_index": 6, "stage_total": 6,
+    })
     from app.pipeline.reassembler import reassemble
 
     result = await session.execute(
@@ -224,8 +270,9 @@ async def _run_pipeline(session, job: Job) -> None:
     await loop.run_in_executor(None, generate_vtt, merged_segments, vtt_path)
 
     src_lang_code = job.detected_language or job.language_hint
+    from app.db_crud import upsert_subtitle
     for fmt, path in [("srt", srt_path), ("vtt", vtt_path)]:
-        session.add(Subtitle(job_id=job.id, format=fmt, path=path, language=src_lang_code))
+        await upsert_subtitle(session, job.id, fmt, path, src_lang_code)
 
     job.status = "done"
     await session.commit()
@@ -236,15 +283,12 @@ async def _run_pipeline(session, job: Job) -> None:
 async def _run_translation_phase(session, job: Job, loop, source_lang: str) -> None:
     """Phase 5.5: context build → semantic chunk → translate → emit translated subtitles."""
     import json as _json
+    import dataclasses
     from app.pipeline.reassembler import reassemble as _reassemble_all
-    from app.pipeline.semantic_chunker import chunk_for_translation
-    from app.pipeline.context_builder import build_context
-    from app.pipeline.translator import translate_unit, select_translator_mode
-    from app.pipeline.translation_reassembler import distribute_translation_to_segments
-    from app.pipeline.glossary import Glossary
+    from app.pipeline.translator import select_translator_mode
     from app.pipeline.subtitle_generator import generate_srt, generate_vtt
+    from app.pipeline.translation_orchestrator import run_translation_compute
     from app.models_db import TranslationChunk as TranslationChunkRow
-    from app.ml.base import TranslatedSegment as _TlSeg
 
     await _update_job(session, job, status="translating")
 
@@ -261,129 +305,69 @@ async def _run_translation_phase(session, job: Job, loop, source_lang: str) -> N
         for c in stt_chunks if c.transcript_json
     ]
 
-    all_segs_dicts: list = []
-    for c in stt_chunks:
-        if c.transcript_json:
-            parsed = _json.loads(c.transcript_json)
-            offset = c.start_time
-            for s in parsed:
-                all_segs_dicts.append({
-                    "text": s.get("text", ""),
-                    "start": s.get("start", 0) + offset,
-                    "end": s.get("end", 0) + offset,
-                })
-
-    is_video = mode == "vlm"
-    job_dir = str(storage.job_dir(job.id))
-
     await publish_job_progress(job.id, {
         "job_id": job.id, "status": "translating", "phase": "context",
         "total_chunks": job.total_chunks, "completed_chunks": 0, "percent": 0,
     })
 
-    context = await loop.run_in_executor(
-        None, build_context,
-        source_lang, job.target_language, all_segs_dicts,
-        job.video_path if is_video else None, job_dir, is_video,
+    source_segments = await loop.run_in_executor(None, _reassemble_all, stt_chunk_data)
+    is_video = mode == "vlm"
+    job_dir = str(storage.job_dir(job.id))
+
+    def _on_progress(done: int, total: int) -> None:
+        asyncio.run_coroutine_threadsafe(
+            publish_job_progress(job.id, {
+                "job_id": job.id, "status": "translating", "phase": "translating",
+                "total_chunks": total, "completed_chunks": done,
+                "percent": int(done / total * 100),
+                "stage_index": 5, "stage_total": 6,
+            }),
+            loop,
+        )
+
+    translated_segs, unit_results, context = await loop.run_in_executor(
+        None,
+        lambda: run_translation_compute(
+            source_segments, source_lang, job.target_language,
+            mode, job.enable_refinement, job.glossary_json or "",
+            job.video_path if is_video else None, job_dir,
+            on_progress=_on_progress,
+        ),
     )
+
+    # Persist context bundle
     job.context_bundle_json = _json.dumps({
         "domain": context.domain, "format": context.format,
         "named_entities": context.named_entities, "idioms_detected": context.idioms_detected,
         "scene_description": context.scene_description, "notes": context.notes,
     })
-    await session.commit()
 
-    glossary = Glossary.from_domain(context.domain)
-    if job.glossary_json:
-        try:
-            glossary = glossary.merge(Glossary.from_user_text(job.glossary_json))
-        except Exception:
-            pass
-
-    merged_for_chunking = await loop.run_in_executor(None, _reassemble_all, stt_chunk_data)
-    seg_dicts = [{"text": s.text, "start": s.start, "end": s.end} for s in merged_for_chunking]
-    translation_units = await loop.run_in_executor(
-        None, chunk_for_translation, seg_dicts,
-        settings.TRANSLATION_MAX_CHUNK_SECONDS, settings.TRANSLATION_SILENCE_GAP,
-    )
-
-    for unit in translation_units:
+    # Persist translation units
+    for ur in unit_results:
         session.add(TranslationChunkRow(
-            job_id=job.id, sequence=unit.sequence,
-            start_time=unit.start_time, end_time=unit.end_time,
-            source_text=unit.source_text, status="pending",
+            job_id=job.id, sequence=ur["sequence"],
+            start_time=ur["start_time"], end_time=ur["end_time"],
+            source_text=ur["source_text"],
+            first_pass=ur["first_pass"],
+            translated_text=ur["final_text"],
+            status="done",
         ))
-    await session.commit()
-
-    history: list = []
-    translated_texts: list[str] = []
-    n_units = len(translation_units)
-
-    for i, unit in enumerate(translation_units):
-        prev_text = translation_units[i - 1].source_text if i > 0 else ""
-        next_text = translation_units[i + 1].source_text if i < n_units - 1 else ""
-
-        await publish_job_progress(job.id, {
-            "job_id": job.id, "status": "translating", "phase": "translating",
-            "total_chunks": n_units, "completed_chunks": i, "percent": int(i / n_units * 100),
-        })
-
-        first_pass = unit.source_text
-        final_text = unit.source_text
-        try:
-            first_pass, final_text = await loop.run_in_executor(
-                None, translate_unit,
-                unit, job.video_path if is_video else None,
-                source_lang, job.target_language,
-                mode, history, prev_text, next_text,
-                context, glossary, job.enable_refinement,
-            )
-        except ModelNotReady:
-            raise
-        except Exception as exc:
-            logger.error(f"Translation unit {unit.sequence} failed: {exc}")
-
-        translated_texts.append(final_text)
-
-        tc_result = await session.execute(
-            select(TranslationChunkRow).where(
-                TranslationChunkRow.job_id == job.id,
-                TranslationChunkRow.sequence == unit.sequence,
-            )
-        )
-        tc_row = tc_result.scalar_one_or_none()
-        if tc_row:
-            tc_row.first_pass = first_pass
-            tc_row.translated_text = final_text
-            tc_row.status = "done"
-        await session.commit()
-
-        dummy_ts = _TlSeg(
-            text=final_text, start=unit.start_time, end=unit.end_time,
-            source_text=unit.source_text, source_language=source_lang,
-            target_language=job.target_language,
-        )
-        history = (history + [dummy_ts])[-settings.TRANSLATION_CONTEXT_WINDOW:]
 
     job.translation_status = "done"
     await session.commit()
 
-    translated_segs = await loop.run_in_executor(
-        None, distribute_translation_to_segments,
-        merged_for_chunking, translation_units, translated_texts, job.target_language,
-    )
-
     await publish_job_progress(job.id, {
         "job_id": job.id, "status": "translating", "phase": "assembling",
-        "total_chunks": n_units, "completed_chunks": n_units, "percent": 100,
+        "total_chunks": len(unit_results), "completed_chunks": len(unit_results), "percent": 100,
     })
 
     tl_srt = str(storage.subtitle_path(job.id, "srt")).replace(".srt", f"_{job.target_language}.srt")
     tl_vtt = str(storage.subtitle_path(job.id, "vtt")).replace(".vtt", f"_{job.target_language}.vtt")
     await loop.run_in_executor(None, generate_srt, translated_segs, tl_srt)
     await loop.run_in_executor(None, generate_vtt, translated_segs, tl_vtt)
+    from app.db_crud import upsert_subtitle
     for fmt, path in [("srt", tl_srt), ("vtt", tl_vtt)]:
-        session.add(Subtitle(job_id=job.id, format=fmt, path=path, language=job.target_language))
+        await upsert_subtitle(session, job.id, fmt, path, job.target_language)
     await session.commit()
 
 

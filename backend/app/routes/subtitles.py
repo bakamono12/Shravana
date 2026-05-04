@@ -46,9 +46,9 @@ async def download_subtitle(
                 Subtitle.job_id == job_id,
                 Subtitle.format == fmt,
                 Subtitle.language == effective_lang,
-            )
+            ).order_by(Subtitle.created_at.desc())
         )
-        sub = result.scalar_one_or_none()
+        sub = result.scalars().first()
         if not sub:
             # Fall back to source-language subtitle (language IS NULL or doesn't match)
             result = await db.execute(

@@ -6,6 +6,7 @@ pipeline_runner.py, transcriber.py, translator.py, and denoiser.py remain unchan
 """
 from __future__ import annotations
 import dataclasses
+import io
 import json
 import logging
 from pathlib import Path
@@ -111,65 +112,106 @@ class RemoteTranslatorProxy(BaseTranslator):
         context: Optional[ContextBundle] = None,
         glossary_text: str = "",
     ) -> List[TranslatedSegment]:
-        from app.ml.remote_client import call_multipart
+        from app.ml.remote_client import call_multipart, Remote524Error
 
-        payload = {
-            "model": self.model_name,
-            "segments": [_seg_to_dict(s) for s in segments],
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "history": [_tl_to_dict(h) for h in history],
-            "context": _ctx_to_dict(context) if context else None,
-            "glossary_text": glossary_text,
-        }
-
-        files: dict = {"payload": (None, json.dumps(payload), "application/json")}
+        # Read file bytes upfront so they can be replayed on a 524 retry.
+        audio_bytes: Optional[bytes] = None
         if audio_path:
-            files["audio"] = open(audio_path, "rb")
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+        frame_bytes: List[bytes] = []
         if frames:
-            for i, fp in enumerate(frames):
-                files[f"frame_{i}"] = open(str(fp), "rb")
+            for fp in frames:
+                with open(str(fp), "rb") as f:
+                    frame_bytes.append(f.read())
+
+        def _build_files(segs: List[TranscriptSegment]) -> dict:
+            payload = {
+                "model": self.model_name,
+                "segments": [_seg_to_dict(s) for s in segs],
+                "source_lang": source_lang,
+                "target_lang": target_lang,
+                "history": [_tl_to_dict(h) for h in history],
+                "context": _ctx_to_dict(context) if context else None,
+                "glossary_text": glossary_text,
+            }
+            files: dict = {"payload": (None, json.dumps(payload), "application/json")}
+            if audio_bytes is not None:
+                files["audio"] = ("audio.wav", io.BytesIO(audio_bytes), "audio/wav")
+            for i, fb in enumerate(frame_bytes):
+                files[f"frame_{i}"] = (f"frame_{i}.jpg", io.BytesIO(fb), "image/jpeg")
+            return files
 
         try:
-            resp = call_multipart("/v1/translate", files=files)
-        finally:
-            for name, fobj in files.items():
-                if name not in ("payload",) and hasattr(fobj, "close"):
-                    try:
-                        fobj.close()
-                    except Exception:
-                        pass
-
-        return [_dict_to_tl(s) for s in resp.get("segments", [])]
+            resp = call_multipart("/v1/translate", files=_build_files(segments))
+            return [_dict_to_tl(s) for s in resp.get("segments", [])]
+        except Remote524Error:
+            # Cloudflare upstream timeout — retry once with segments split in half.
+            # The worker also batches ≤4 segs per model call, so this is a belt-and-suspenders
+            # fallback for edge cases (very long individual chunks).
+            logger.warning(
+                "Remote translate 524; retrying with halved segment batches (%d → 2×%d)",
+                len(segments), len(segments) // 2 or 1,
+            )
+            mid = max(1, len(segments) // 2)
+            results: List[TranslatedSegment] = []
+            for chunk_segs in (segments[:mid], segments[mid:]):
+                if not chunk_segs:
+                    continue
+                resp = call_multipart("/v1/translate", files=_build_files(chunk_segs))
+                results.extend(_dict_to_tl(s) for s in resp.get("segments", []))
+            return results
 
     def refine(
         self,
-        segments: List[TranscriptSegment],
+        first_pass: str,
+        source_text: str,
+        prev_chunk: str,
+        next_chunk: str,
         source_lang: str,
         target_lang: str,
-        history: List[TranslatedSegment],
+        start: float,
+        end: float,
         context: Optional[ContextBundle] = None,
         glossary_text: str = "",
-        first_pass_texts: Optional[List[str]] = None,
-        prev_text: str = "",
-        next_text: str = "",
-    ) -> List[TranslatedSegment]:
+    ) -> str:
+        """Match QwenVLTranslator.refine signature; forwards to worker /v1/translate/refine."""
         from app.ml.remote_client import call_json
 
         payload = {
             "model": self.model_name,
-            "segments": [_seg_to_dict(s) for s in segments],
+            "first_pass": first_pass,
+            "source_text": source_text,
+            "prev_text": prev_chunk,
+            "next_text": next_chunk,
             "source_lang": source_lang,
             "target_lang": target_lang,
-            "history": [_tl_to_dict(h) for h in history],
+            "start": start,
+            "end": end,
             "context": _ctx_to_dict(context) if context else None,
             "glossary_text": glossary_text,
-            "first_pass_texts": first_pass_texts or [],
-            "prev_text": prev_text,
-            "next_text": next_text,
         }
         resp = call_json("/v1/translate/refine", json_data=payload)
-        return [_dict_to_tl(s) for s in resp.get("segments", [])]
+        return resp.get("text", first_pass)
+
+    def _call_model(
+        self,
+        source_text: str,
+        system_prompt: str,
+        history_text: str,
+        frames=None,
+    ) -> str:
+        """Forward a raw text-generation call to the worker's /v1/generate endpoint."""
+        from app.ml.remote_client import call_json
+
+        payload = {
+            "model": self.model_name,
+            "source_text": source_text,
+            "system_prompt": system_prompt,
+            "history_text": history_text or "",
+        }
+        resp = call_json("/v1/generate", json_data=payload)
+        return resp.get("text", "")
 
 
 # ------------------------------------------------------------------ #

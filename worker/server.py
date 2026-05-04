@@ -24,8 +24,11 @@ import zipfile
 from pathlib import Path
 from typing import Any, List, Optional
 
+import asyncio
+import threading
+
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, Depends
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 # ── Make backend.app importable when running from repo root ──────────────────
 import sys
@@ -37,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 WORKER_TOKEN: str = os.getenv("WORKER_TOKEN", "")
 MODELS_DIR: Path = Path(os.getenv("WORKER_MODELS_DIR", str(_REPO_ROOT / "storage" / "models")))
 DEVICE: str = os.getenv("WORKER_DEVICE", "")
+WORKER_API_VERSION: int = int(os.getenv("WORKER_API_VERSION", "2"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger("worker")
@@ -80,15 +84,9 @@ def _get_model(name: str):
     if cls_name == "QwenASRModel":
         from app.ml.qwen_asr import QwenASRModel
         instance = QwenASRModel(**kwargs)
-    elif cls_name == "ParakeetModel":
-        from app.ml.parakeet import ParakeetModel
-        instance = ParakeetModel(**kwargs)
     elif cls_name == "WhisperTurboModel":
         from app.ml.whisper_turbo import WhisperTurboModel
         instance = WhisperTurboModel(**kwargs)
-    elif cls_name == "ForcedAlignerModel":
-        from app.ml.forced_aligner import ForcedAlignerModel
-        instance = ForcedAlignerModel(**kwargs)
     elif cls_name == "SeamlessM4TTranslator":
         from app.ml.seamless_translator import SeamlessM4TTranslator
         instance = SeamlessM4TTranslator(**kwargs)
@@ -177,6 +175,7 @@ async def health(_: None = Depends(_check_auth)) -> dict:
 
     return {
         "status": "ok",
+        "api_version": WORKER_API_VERSION,
         "gpu": gpu_info,
         "models_loaded": list(_instances.keys()),
     }
@@ -250,26 +249,6 @@ async def detect_language(
         os.unlink(tmp_path)
 
 
-@app.post("/v1/asr/align")
-async def align_segments(
-    audio: UploadFile = File(...),
-    payload: str = Form(...),
-    _: None = Depends(_check_auth),
-) -> dict:
-    body = json.loads(payload)
-    model_name = body["model"]
-    segments = [_dict_to_seg(s) for s in body.get("segments", [])]
-    m = _get_model(model_name)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(await audio.read())
-        tmp_path = tmp.name
-    try:
-        aligned = m.align(tmp_path, segments)
-        return {"segments": [dataclasses.asdict(s) for s in aligned]}
-    finally:
-        os.unlink(tmp_path)
-
-
 # ── Translation endpoints ─────────────────────────────────────────────────────
 
 @app.post("/v1/translate")
@@ -293,6 +272,8 @@ async def translate(
 
     m = _get_model(model_name)
 
+    _MAX_SEGS_PER_BATCH = 4  # keep each model call under ~30s to avoid Cloudflare 524
+
     audio_tmp: Optional[str] = None
     frame_tmps: list[str] = []
     try:
@@ -314,17 +295,27 @@ async def translate(
             i += 1
 
         frames = [Path(p) for p in frame_tmps] if frame_tmps else None
-        segs = m.translate(
-            segments=segments,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            history=history,
-            audio_path=audio_tmp,
-            frames=frames,
-            context=context,
-            glossary_text=glossary_text,
-        )
-        return {"segments": [dataclasses.asdict(s) for s in segs]}
+
+        # Batch segments to keep each translate() call ≤_MAX_SEGS_PER_BATCH so
+        # SeamlessM4T never runs for >100 s in a single call (Cloudflare 524 threshold).
+        all_results = []
+        rolling_history = list(history)
+        for batch_start in range(0, max(1, len(segments)), _MAX_SEGS_PER_BATCH):
+            batch = segments[batch_start:batch_start + _MAX_SEGS_PER_BATCH]
+            batch_segs = m.translate(
+                segments=batch,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                history=rolling_history,
+                audio_path=audio_tmp,
+                frames=frames,
+                context=context,
+                glossary_text=glossary_text,
+            )
+            all_results.extend(batch_segs)
+            rolling_history = rolling_history + batch_segs
+
+        return {"segments": [dataclasses.asdict(s) for s in all_results]}
     finally:
         if audio_tmp:
             try:
@@ -344,29 +335,40 @@ async def refine(
     _: None = Depends(_check_auth),
 ) -> dict:
     model_name = body["model"]
-    segments = [_dict_to_seg(s) for s in body.get("segments", [])]
-    source_lang = body["source_lang"]
-    target_lang = body["target_lang"]
-    history = [_dict_to_tl(h) for h in body.get("history", [])]
     context = _dict_to_ctx(body.get("context"))
     glossary_text = body.get("glossary_text", "")
-    first_pass_texts = body.get("first_pass_texts", [])
-    prev_text = body.get("prev_text", "")
-    next_text = body.get("next_text", "")
 
     m = _get_model(model_name)
-    segs = m.refine(
-        segments=segments,
-        source_lang=source_lang,
-        target_lang=target_lang,
-        history=history,
+    result = m.refine(
+        first_pass=body.get("first_pass", ""),
+        source_text=body.get("source_text", ""),
+        prev_chunk=body.get("prev_text", ""),
+        next_chunk=body.get("next_text", ""),
+        source_lang=body.get("source_lang", "en"),
+        target_lang=body.get("target_lang", "en"),
+        start=float(body.get("start", 0.0)),
+        end=float(body.get("end", 0.0)),
         context=context,
         glossary_text=glossary_text,
-        first_pass_texts=first_pass_texts,
-        prev_text=prev_text,
-        next_text=next_text,
     )
-    return {"segments": [dataclasses.asdict(s) for s in segs]}
+    return {"text": result}
+
+
+@app.post("/v1/generate")
+async def generate(
+    body: dict,
+    _: None = Depends(_check_auth),
+) -> dict:
+    """Raw text generation (used by context builder when remote)."""
+    model_name = body["model"]
+    m = _get_model(model_name)
+    result = m._call_model(
+        source_text=body.get("source_text", ""),
+        system_prompt=body.get("system_prompt", ""),
+        history_text=body.get("history_text", ""),
+        frames=None,
+    )
+    return {"text": result}
 
 
 # ── Denoiser endpoint ─────────────────────────────────────────────────────────
@@ -404,3 +406,220 @@ async def denoise_audio(
         media_type="audio/wav",
         headers={"X-Speech-Intervals": intervals_b64},
     )
+
+
+# ── Full pipeline endpoint (streaming NDJSON) ─────────────────────────────────
+
+@app.post("/v1/pipeline/run")
+async def pipeline_run(
+    request: Request,
+    _: None = Depends(_check_auth),
+) -> StreamingResponse:
+    """
+    Run phases 2-7 (denoise → chunk → transcribe → translate → assemble) on the
+    worker and stream NDJSON progress events back.
+
+    Multipart fields:
+      audio    (required) — raw WAV file from local Phase 1 extraction
+      video    (optional) — original video file for VLM keyframe extraction
+      payload  (required) — JSON string with job parameters:
+                  {job_id, language_hint, target_language, translator_mode,
+                   enable_refinement, glossary_text, filename}
+
+    Each NDJSON line is a JSON object. The final line has event="result".
+    """
+    form = await request.form()
+
+    audio_field = form.get("audio")
+    if not audio_field or not hasattr(audio_field, "read"):
+        raise HTTPException(status_code=422, detail="Missing 'audio' form field")
+    payload_raw = form.get("payload")
+    if not payload_raw:
+        raise HTTPException(status_code=422, detail="Missing 'payload' form field")
+    params = json.loads(str(payload_raw))
+
+    # Save uploads to a persistent tempdir (pipeline runs in a thread; can't use async ctx)
+    work_dir = tempfile.mkdtemp(prefix="shravana_pipeline_")
+    raw_wav = os.path.join(work_dir, "raw.wav")
+    with open(raw_wav, "wb") as f:
+        f.write(await audio_field.read())
+
+    video_path: Optional[str] = None
+    video_field = form.get("video")
+    if video_field and hasattr(video_field, "read"):
+        ext = Path(getattr(video_field, "filename", "video.mp4")).suffix or ".mp4"
+        video_path = os.path.join(work_dir, f"video{ext}")
+        with open(video_path, "wb") as f:
+            f.write(await video_field.read())
+        params["video_path"] = video_path
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(event: dict) -> None:
+        """Called from the pipeline thread; marshals event onto the async queue."""
+        fut = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        fut.result(timeout=60)
+
+    def _run() -> None:
+        try:
+            _patch_settings()
+            from worker.pipeline_handler import run_pipeline
+            run_pipeline(raw_wav, params, _emit)
+        except Exception as exc:
+            logger.error(f"Pipeline run failed: {exc}", exc_info=True)
+            asyncio.run_coroutine_threadsafe(
+                queue.put({"event": "error", "message": str(exc)}), loop
+            ).result(timeout=5)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+            import shutil
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _ndjson_generator():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield (json.dumps(event) + "\n").encode()
+
+    return StreamingResponse(_ndjson_generator(), media_type="application/x-ndjson")
+
+
+# ── Two-stage pipeline: transcribe endpoint ───────────────────────────────────
+
+@app.post("/v1/pipeline/transcribe")
+async def pipeline_transcribe(
+    request: Request,
+    _: None = Depends(_check_auth),
+) -> StreamingResponse:
+    """
+    Stage 1: denoise → chunk → transcribe.
+    Returns NDJSON stream; final event has event='result' and workdir_token.
+    The workdir is kept alive for ~30 min so /v1/pipeline/translate can use it.
+    """
+    form = await request.form()
+    audio_field = form.get("audio")
+    if not audio_field or not hasattr(audio_field, "read"):
+        raise HTTPException(status_code=422, detail="Missing 'audio' form field")
+    payload_raw = form.get("payload")
+    if not payload_raw:
+        raise HTTPException(status_code=422, detail="Missing 'payload' form field")
+    params = json.loads(str(payload_raw))
+
+    # Stage 1 keeps its own workdir (managed by pipeline_handler._store)
+    staging_dir = tempfile.mkdtemp(prefix="shravana_stage1_")
+    raw_wav = os.path.join(staging_dir, "raw.wav")
+    with open(raw_wav, "wb") as f:
+        f.write(await audio_field.read())
+
+    video_path: Optional[str] = None
+    video_field = form.get("video")
+    if video_field and hasattr(video_field, "read"):
+        ext = Path(getattr(video_field, "filename", "video.mp4")).suffix or ".mp4"
+        video_path = os.path.join(staging_dir, f"video{ext}")
+        with open(video_path, "wb") as f:
+            f.write(await video_field.read())
+        params["video_path"] = video_path
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(event: dict) -> None:
+        fut = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        fut.result(timeout=60)
+
+    def _run() -> None:
+        try:
+            _patch_settings()
+            from worker.pipeline_handler import run_transcribe
+            run_transcribe(raw_wav, params, _emit)
+        except Exception as exc:
+            logger.error(f"Transcribe stage failed: {exc}", exc_info=True)
+            asyncio.run_coroutine_threadsafe(
+                queue.put({"event": "error", "message": str(exc)}), loop
+            ).result(timeout=5)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+            import shutil
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _gen():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield (json.dumps(event) + "\n").encode()
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+
+
+# ── Two-stage pipeline: translate endpoint ────────────────────────────────────
+
+@app.post("/v1/pipeline/translate")
+async def pipeline_translate(
+    body: dict,
+    _: None = Depends(_check_auth),
+) -> StreamingResponse:
+    """
+    Stage 2: translate segments stored by /v1/pipeline/transcribe.
+    Body JSON: {workdir_token, target_language, translator_mode, enable_refinement, glossary_text}.
+    Returns NDJSON stream; final event has event='result' with segments_tl.
+    """
+    token = body.get("workdir_token")
+    if not token:
+        raise HTTPException(status_code=422, detail="Missing workdir_token")
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(event: dict) -> None:
+        fut = asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        fut.result(timeout=60)
+
+    def _run() -> None:
+        try:
+            _patch_settings()
+            from worker.pipeline_handler import run_translate
+            run_translate(token, body, _emit)
+        except KeyError as exc:
+            asyncio.run_coroutine_threadsafe(
+                queue.put({"event": "error", "message": f"Workdir token expired: {exc}"}), loop
+            ).result(timeout=5)
+        except Exception as exc:
+            logger.error(f"Translate stage failed: {exc}", exc_info=True)
+            asyncio.run_coroutine_threadsafe(
+                queue.put({"event": "error", "message": str(exc)}), loop
+            ).result(timeout=5)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _gen():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield (json.dumps(event) + "\n").encode()
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+
+
+# ── Delete workdir (cleanup before TTL) ──────────────────────────────────────
+
+@app.delete("/v1/pipeline/workdir/{token}")
+async def delete_workdir(
+    token: str,
+    _: None = Depends(_check_auth),
+) -> dict:
+    from worker.pipeline_handler import _evict
+    _evict(token)
+    return {"status": "evicted"}

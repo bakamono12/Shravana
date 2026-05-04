@@ -62,6 +62,10 @@ def _retry_call(fn, *args, retries: int = 2, **kwargs) -> Any:
     raise RemoteCallError(f"Remote GPU unreachable after {retries + 1} attempt(s): {last_exc}") from last_exc
 
 
+class Remote524Error(RemoteCallError):
+    """Cloudflare upstream timeout (HTTP 524) — caller may retry with a smaller batch."""
+
+
 def _parse_response(resp: httpx.Response) -> Any:
     if resp.status_code == 401:
         raise RemoteCallError("Remote GPU: authentication failed — check REMOTE_GPU_TOKEN")
@@ -74,6 +78,8 @@ def _parse_response(resp: httpx.Response) -> Any:
         if model:
             raise ModelNotReady(model)
         raise RemoteCallError(f"Remote GPU service unavailable: {body}")
+    if resp.status_code == 524:
+        raise Remote524Error("Remote GPU timed out (Cloudflare 524) — batch may be too large")
     resp.raise_for_status()
     return resp.json()
 
@@ -117,6 +123,54 @@ def call_multipart_binary(path: str, files: dict, data: Optional[dict] = None) -
         return resp.content
 
     return _retry_call(_do, retries=settings.LLM_MAX_RETRIES)
+
+
+def call_streaming_multipart(path: str, files: dict, data: Optional[dict] = None):
+    """POST multipart, stream NDJSON response. Yields parsed dicts. Sync generator."""
+    from app.config import settings
+    client = _get_client()
+    with client.stream(
+        "POST", path, files=files, data=data or {},
+        timeout=settings.REMOTE_GPU_TIMEOUT_S,
+    ) as resp:
+        if resp.status_code == 401:
+            raise RemoteCallError("Remote GPU: authentication failed — check REMOTE_GPU_TOKEN")
+        if resp.status_code != 200:
+            body = resp.read().decode(errors="replace")[:500]
+            raise RemoteCallError(f"Remote {path} returned {resp.status_code}: {body}")
+        for raw_line in resp.iter_lines():
+            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.strip().decode()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.debug(f"Non-JSON line from worker: {raw_line!r}: {exc}")
+
+
+def call_streaming_json(path: str, json_data: dict):
+    """POST JSON, stream NDJSON response. Yields parsed dicts. Sync generator."""
+    from app.config import settings
+    client = _get_client()
+    with client.stream(
+        "POST", path, json=json_data,
+        timeout=settings.REMOTE_GPU_TIMEOUT_S,
+    ) as resp:
+        if resp.status_code == 401:
+            raise RemoteCallError("Remote GPU: authentication failed — check REMOTE_GPU_TOKEN")
+        if resp.status_code == 410:
+            raise RemoteCallError(f"Workdir token expired (410)")
+        if resp.status_code != 200:
+            body = resp.read().decode(errors="replace")[:500]
+            raise RemoteCallError(f"Remote {path} returned {resp.status_code}: {body}")
+        for raw_line in resp.iter_lines():
+            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.strip().decode()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.debug(f"Non-JSON line from worker: {raw_line!r}: {exc}")
 
 
 def health() -> dict:

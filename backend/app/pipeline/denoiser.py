@@ -7,19 +7,26 @@ Outputs clean.wav and a list of speech intervals [(start_sec, end_sec)].
 """
 from __future__ import annotations
 import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-def denoise(raw_wav: str, output_dir: str, job_id: str) -> Tuple[str, List[Tuple[float, float]]]:
+def denoise(
+    raw_wav: str,
+    output_dir: str,
+    job_id: str,
+    on_progress: Optional[Callable[[str, int], None]] = None,
+) -> Tuple[str, List[Tuple[float, float]]]:
     """
     Returns (clean_wav_path, speech_intervals).
-    speech_intervals is a list of (start, end) pairs in seconds where speech is detected.
-    Delegates to the remote GPU worker when REMOTE_GPU_URL is configured.
+    on_progress(subphase, percent) is called during demucs (subphase='demucs'),
+    and at fixed points for noisereduce ('noisereduce') and vad ('vad').
+    Delegates to the remote GPU worker when configured (no local progress in that path).
     """
     from app.config import settings
     if settings.REMOTE_GPU_URL:
@@ -32,31 +39,63 @@ def denoise(raw_wav: str, output_dir: str, job_id: str) -> Tuple[str, List[Tuple
                 raise
             logger.warning(f"Remote denoise failed ({exc}), falling back to local execution")
 
-    vocals_wav = _run_demucs(raw_wav, output_dir)
+    def _demucs_progress(pct: int) -> None:
+        if on_progress:
+            # Scale demucs (0-100) to 0-60 of overall denoise
+            on_progress("demucs", int(pct * 0.6))
+
+    vocals_wav = _run_demucs(raw_wav, output_dir, on_progress=_demucs_progress)
+    if on_progress:
+        on_progress("noisereduce", 70)
     clean_wav = _run_noisereduce(vocals_wav, str(Path(output_dir) / "clean.wav"))
+    if on_progress:
+        on_progress("vad", 85)
     speech_intervals = _run_vad(clean_wav)
+    if on_progress:
+        on_progress("vad", 100)
     return clean_wav, speech_intervals
 
 
-def _run_demucs(raw_wav: str, output_dir: str) -> str:
-    """Run demucs to extract vocals stem."""
+def _run_demucs(
+    raw_wav: str,
+    output_dir: str,
+    on_progress: Optional[Callable[[int], None]] = None,
+    device: str = "cpu",
+) -> str:
+    """Run demucs to extract vocals stem.
+
+    Calls on_progress(percent: int) as demucs reports progress via stderr.
+    Existing callers pass no arguments beyond output_dir; behaviour is unchanged.
+    """
     out = Path(output_dir) / "demucs_out"
     out.mkdir(parents=True, exist_ok=True)
+    _pct_re = re.compile(r"(\d+)%")
+    stderr_buf: list[str] = []
     try:
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "demucs",
-                "--two-stems=vocals",
-                "--device", "cpu",
-                "--out", str(out),
-                raw_wav,
-            ],
-            capture_output=True,
-            text=True,
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "demucs", "--two-stems=vocals",
+             "--device", device, "--out", str(out), raw_wav],
+            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
         )
-        if result.returncode != 0:
+        # Demucs / tqdm uses \r for in-place progress — read in small chunks
+        tail = ""
+        while True:
+            chunk = proc.stderr.read(256)  # type: ignore[union-attr]
+            if not chunk:
+                break
+            tail += chunk
+            parts = re.split(r"[\r\n]", tail)
+            tail = parts[-1]
+            for part in parts[:-1]:
+                stderr_buf.append(part)
+                if on_progress:
+                    m = _pct_re.search(part)
+                    if m:
+                        on_progress(int(m.group(1)))
+        proc.wait()
+        if proc.returncode != 0:
             raise RuntimeError(
-                f"demucs exited {result.returncode}:\nSTDOUT: {result.stdout[-2000:]}\nSTDERR: {result.stderr[-2000:]}"
+                f"demucs exited {proc.returncode}:\n{''.join(stderr_buf[-20:])}"
             )
         found = list(out.rglob("vocals.wav"))
         if not found:

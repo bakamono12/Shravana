@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Float, Integer, DateTime, ForeignKey, Text, Boolean
+from sqlalchemy import String, Float, Integer, DateTime, ForeignKey, Text, Boolean, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
@@ -43,6 +43,8 @@ class Job(Base):
     executor: Mapped[str] = mapped_column(String, default="local")
     # snapshot of REMOTE_GPU_URL at job time (for debugging/audit)
     remote_url_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # token referencing worker-side temp workdir (two-stage remote handoff)
+    workdir_token: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
@@ -99,12 +101,15 @@ class TranslationChunk(Base):
 
 class Subtitle(Base):
     __tablename__ = "subtitles"
+    __table_args__ = (
+        UniqueConstraint("job_id", "format", "language", name="uq_subtitle_job_fmt_lang"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
     format: Mapped[str] = mapped_column(String, nullable=False)  # srt|vtt|json
     path: Mapped[str] = mapped_column(String, nullable=False)
-    # BCP-47 language code; NULL means source language (legacy rows)
+    # BCP-47 language code
     language: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 

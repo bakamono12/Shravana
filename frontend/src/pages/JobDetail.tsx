@@ -3,7 +3,7 @@ import { ArrowLeft, RefreshCw, CheckCircle, XCircle, Loader, Clock, AlertCircle,
 import { useJob } from "../hooks/useJob";
 import { MediaPreview } from "../components/MediaPreview";
 import { api, LangInfo } from "../lib/api";
-import { fmtDate, fmtEta } from "../lib/utils";
+import { fmtDate } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { useState, useEffect } from "react";
 
@@ -99,8 +99,18 @@ export function JobDetail() {
     </div>
   );
 
-  const pct = job.total_chunks > 0 ? Math.round((job.completed_chunks / job.total_chunks) * 100) : 0;
   const isActive = !["done", "failed", "pending", "waiting_for_models"].includes(job.status);
+
+  // Overall progress: use stage_index/stage_total when available, else chunk-based
+  const stagePct = job.percent ?? 0;
+  const pct = (() => {
+    if (job.status === "done") return 100;
+    if (job.stage_index != null && job.stage_total != null) {
+      return Math.round(((job.stage_index - 1) + stagePct / 100) / job.stage_total * 100);
+    }
+    if (job.total_chunks > 0) return Math.round((job.completed_chunks / job.total_chunks) * 100);
+    return stagePct;
+  })();
 
   const retry = async () => {
     if (!jobId) return;
@@ -146,7 +156,14 @@ export function JobDetail() {
             {job.status === "waiting_for_models" && <AlertCircle size={18} className="text-yellow-500" />}
             {isActive && <Loader size={18} className="text-primary animate-spin" />}
             {job.status === "pending" && <Clock size={18} className="text-muted-foreground" />}
-            <span className="font-medium">{PHASE_LABELS[job.status] ?? job.status}</span>
+            <span className="font-medium">
+              {PHASE_LABELS[job.status] ?? job.status}
+              {job.subphase && (
+                <span className="text-muted-foreground font-normal">
+                  {" · "}{job.subphase}{job.percent != null ? ` ${job.percent}%` : ""}
+                </span>
+              )}
+            </span>
           </div>
           <div className="flex items-center gap-3">
             {["failed", "waiting_for_models"].includes(job.status) && (
@@ -170,11 +187,16 @@ export function JobDetail() {
           </div>
         </div>
 
-        {job.total_chunks > 0 && (
+        {(isActive || job.status === "done") && (
           <>
             <div className="flex justify-between text-xs text-muted-foreground">
-              <span>{job.completed_chunks} / {job.total_chunks} chunks</span>
-              <span>{pct}%</span>
+              <span>
+                {job.total_chunks > 0
+                  ? `${job.completed_chunks} / ${job.total_chunks} chunks`
+                  : PHASE_LABELS[job.status] ?? job.status}
+                {job.subphase && <span className="ml-1 opacity-70">· {job.subphase}</span>}
+              </span>
+              <span className="tabular-nums">{pct}%{stagePct > 0 && job.stage_total != null && ` (${stagePct}% this stage)`}</span>
             </div>
             <div className="h-2 rounded-full bg-muted overflow-hidden">
               <div

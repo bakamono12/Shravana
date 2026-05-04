@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _cache: dict[str, Any] = {
     "healthy": False,
     "last_check": None,
+    "api_version": 1,
     "gpu_info": {},
     "models_loaded": [],
     "error": None,
@@ -34,6 +35,7 @@ async def _poll_once() -> None:
     _cache["last_check"] = time.time()
     if result:
         _cache["healthy"] = True
+        _cache["api_version"] = int(result.get("api_version", 1))
         _cache["gpu_info"] = result.get("gpu", {})
         _cache["models_loaded"] = result.get("models_loaded", [])
         _cache["error"] = None

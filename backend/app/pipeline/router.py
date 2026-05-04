@@ -2,7 +2,6 @@
 from app.config import settings
 
 LANGUAGE_MODEL_MAP: dict[str, str] = {
-    "en": "parakeet",
     "hi": "qwen3_asr",
     "mr": "whisper_turbo",
 }

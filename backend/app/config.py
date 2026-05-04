@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     SHRAVANA_SERVE_UI: bool = False
 
     class Config:
-        env_file = ".env"
+        env_file = str(Path(__file__).parent.parent / ".env")
         env_file_encoding = "utf-8"
 
 

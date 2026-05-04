@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { type Job, api } from "../lib/api";
-import { cn, fmtDate, fmtEta } from "../lib/utils";
+import { cn, fmtDate } from "../lib/utils";
 import { CheckCircle, XCircle, Clock, Loader, AlertCircle, Download, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 

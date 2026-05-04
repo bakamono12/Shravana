@@ -23,20 +23,10 @@ MODEL_CONFIGS = {
         "class": "QwenASRModel",
         "kwargs": {"model_id": settings.QWEN_ASR_MODEL_ID, "lid_only": False},
     },
-    "parakeet": {
-        "repo_id": settings.PARAKEET_MODEL_ID,
-        "class": "ParakeetModel",
-        "kwargs": {"model_id": settings.PARAKEET_MODEL_ID},
-    },
     "whisper_turbo": {
         "repo_id": f"faster-whisper/{settings.WHISPER_MODEL_SIZE}",
         "class": "WhisperTurboModel",
         "kwargs": {"model_size": settings.WHISPER_MODEL_SIZE},
-    },
-    "forced_aligner": {
-        "repo_id": settings.FORCED_ALIGNER_MODEL_ID,
-        "class": "ForcedAlignerModel",
-        "kwargs": {"model_id": settings.FORCED_ALIGNER_MODEL_ID},
     },
     # Translation models
     "seamless_v2": {
@@ -71,17 +61,15 @@ def _remote_proxy_for(name: str):
     if name in _instances:
         return _instances[name]
 
-    from app.ml.remote_proxies import RemoteSTTProxy, RemoteTranslatorProxy, RemoteAlignerProxy
+    from app.ml.remote_proxies import RemoteSTTProxy, RemoteTranslatorProxy
 
     cfg = MODEL_CONFIGS.get(name, {})
     cls_name = cfg.get("class", "")
 
-    if cls_name in ("QwenASRModel", "ParakeetModel", "WhisperTurboModel"):
+    if cls_name in ("QwenASRModel", "WhisperTurboModel"):
         instance = RemoteSTTProxy(model_name=name)
     elif cls_name in ("SeamlessM4TTranslator", "QwenVLTranslator"):
         instance = RemoteTranslatorProxy(model_name=name)
-    elif cls_name == "ForcedAlignerModel":
-        instance = RemoteAlignerProxy(model_name=name)
     else:
         instance = RemoteSTTProxy(model_name=name)  # generic fallback
 
@@ -131,15 +119,9 @@ def get(name: str):
         if cls_name == "QwenASRModel":
             from app.ml.qwen_asr import QwenASRModel
             instance = QwenASRModel(**kwargs)
-        elif cls_name == "ParakeetModel":
-            from app.ml.parakeet import ParakeetModel
-            instance = ParakeetModel(**kwargs)
         elif cls_name == "WhisperTurboModel":
             from app.ml.whisper_turbo import WhisperTurboModel
             instance = WhisperTurboModel(**kwargs)
-        elif cls_name == "ForcedAlignerModel":
-            from app.ml.forced_aligner import ForcedAlignerModel
-            instance = ForcedAlignerModel(**kwargs)
         elif cls_name == "SeamlessM4TTranslator":
             from app.ml.seamless_translator import SeamlessM4TTranslator
             instance = SeamlessM4TTranslator(**kwargs)
@@ -155,7 +137,7 @@ def get(name: str):
 
 
 def get_local(name: str):
-    """Force local model loading, bypassing remote routing (used for fallback)."""
+    """Force local model loading, bypassing remote routing (used for whisper_turbo local fallback)."""
     with _lock:
         local_key = f"__local__{name}"
         if local_key in _instances:
@@ -171,15 +153,9 @@ def get_local(name: str):
         if cls_name == "QwenASRModel":
             from app.ml.qwen_asr import QwenASRModel
             instance = QwenASRModel(**kwargs)
-        elif cls_name == "ParakeetModel":
-            from app.ml.parakeet import ParakeetModel
-            instance = ParakeetModel(**kwargs)
         elif cls_name == "WhisperTurboModel":
             from app.ml.whisper_turbo import WhisperTurboModel
             instance = WhisperTurboModel(**kwargs)
-        elif cls_name == "ForcedAlignerModel":
-            from app.ml.forced_aligner import ForcedAlignerModel
-            instance = ForcedAlignerModel(**kwargs)
         elif cls_name == "SeamlessM4TTranslator":
             from app.ml.seamless_translator import SeamlessM4TTranslator
             instance = SeamlessM4TTranslator(**kwargs)
