@@ -166,9 +166,16 @@ async def run_remote_transcribe(session, job: "Job", raw_wav_path: str) -> None:
 
 
 async def _persist_transcribe_result(session, job: "Job", result: dict, loop) -> None:
-    from app.pipeline.reassembler import reassemble
     from app.pipeline.subtitle_generator import generate_srt, generate_vtt
     from app.db_crud import upsert_subtitle
+
+    # Defensive: if the stream ended without a result event, surface a clear error
+    # (received_any_event=True prevents the caller from falling back to legacy).
+    if not result.get("workdir_token") and not result.get("segments_src"):
+        raise RemotePipelineError(
+            "Stage 1 finished without a result event (stream cut off?)",
+            received_any_event=True,
+        )
 
     detected_lang = result.get("detected_language") or job.language_hint or "en"
     job.detected_language = detected_lang
@@ -345,19 +352,26 @@ async def run_remote_pipeline(session, job: "Job", raw_wav_path: str) -> None:
             received_any_event=False,
         )
 
-    # Try new two-stage path first
+    # Stage 1: only this stage can trigger the legacy fallback.
+    # If stage 1 produced any events the worker has the new endpoint — don't fall back.
     try:
         await run_remote_transcribe(session, job, raw_wav_path)
-        if job.translate and job.target_language:
-            await run_remote_translate(session, job)
-        return
     except RemotePipelineError as exc:
-        # If we got any events, the worker has the endpoint — don't fall back
         if exc.received_any_event:
             raise
-        logger.info("New two-stage endpoint not available, trying legacy /v1/pipeline/run")
+        logger.info("Worker /v1/pipeline/transcribe unavailable — trying legacy /v1/pipeline/run")
+        await _run_legacy_pipeline(session, job, raw_wav_path)
+        return
 
-    # Legacy fallback
+    # Stage 2: never falls back to legacy — stage 1 already did the heavy work.
+    if job.translate and job.target_language:
+        await run_remote_translate(session, job)
+
+
+async def _run_legacy_pipeline(session, job: "Job", raw_wav_path: str) -> None:
+    """All-in-one legacy fallback using /v1/pipeline/run."""
+    from app.ml.remote_client import call_streaming_multipart
+
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -370,8 +384,6 @@ async def run_remote_pipeline(session, job: "Job", raw_wav_path: str) -> None:
         "glossary_text": job.glossary_json or "",
         "filename": job.filename,
     }
-
-    from app.ml.remote_client import call_streaming_multipart
 
     def _thread() -> None:
         received_any = False
@@ -391,7 +403,6 @@ async def run_remote_pipeline(session, job: "Job", raw_wav_path: str) -> None:
 
     loop.run_in_executor(None, _thread)
 
-    received_any = False
     while True:
         msg = await queue.get()
         kind = msg[0]
@@ -402,7 +413,6 @@ async def run_remote_pipeline(session, job: "Job", raw_wav_path: str) -> None:
             raise RemotePipelineError(errmsg, received_any_event=had_events)
 
         event = msg[1]
-        received_any = True
         ev_type = event.get("event", "progress")
 
         if ev_type == "error":
