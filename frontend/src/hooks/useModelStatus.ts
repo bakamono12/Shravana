@@ -9,11 +9,25 @@ export function useModelStatus() {
     api.listModels().then(setModels).catch(() => {});
 
     const disconnect = connectWs("/ws/models", (data) => {
-      const ev = data as { name: string; status: string; bytes_downloaded: number; bytes_total: number };
+      const ev = data as {
+        name: string;
+        status: string;
+        bytes_downloaded: number;
+        bytes_total: number;
+        attempt?: number;
+        note?: string;
+      };
       setModels((prev) =>
         prev.map((m) =>
           m.name === ev.name
-            ? { ...m, status: ev.status, bytes_downloaded: ev.bytes_downloaded, bytes_total: ev.bytes_total }
+            ? {
+                ...m,
+                status: ev.status,
+                bytes_downloaded: ev.bytes_downloaded,
+                bytes_total: ev.bytes_total,
+                attempt: ev.attempt,
+                note: ev.note,
+              }
             : m
         )
       );

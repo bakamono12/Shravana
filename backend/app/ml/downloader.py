@@ -12,11 +12,16 @@ import asyncio
 import logging
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+# Marker string embedded in the child's `python -c` so we can identify and kill
+# orphan downloaders left over from a previous uvicorn run.
+_CHILD_MARKER = "__SHRAVANA_DOWNLOADER_CHILD__"
 
 from app.config import settings
 from app.ml.registry import MODEL_CONFIGS, SENTINEL_FILE, model_complete
@@ -61,6 +66,95 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _kill_orphan_downloaders() -> int:
+    """Kill any leftover downloader child processes from a previous run.
+
+    Required because uvicorn --reload restarts the parent without killing our
+    `subprocess.Popen` children — they survive as orphans and keep holding
+    fcntl locks on `<model>/.cache/huggingface/download/*.lock`, blocking the
+    fresh process indefinitely.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return 0  # not Linux
+    me = os.getpid()
+    killed = 0
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if _CHILD_MARKER not in cmdline:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
+            logger.warning(f"Killed orphan downloader child PID {pid}")
+        except OSError:
+            pass
+    if killed:
+        # Give them a moment to release locks.
+        time.sleep(0.5)
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            if _CHILD_MARKER in cmdline:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    return killed
+
+
+def _clean_stale_locks(name: str, repo_id: str) -> int:
+    """Remove `.lock` files left behind by a previously-killed download.
+
+    HF uses filelock, and a stale lock file can keep a fresh attempt blocked
+    even when the original holder is long dead. We're the sole writer, so it
+    is safe to wipe these on retry.
+    """
+    removed = 0
+    for root in (_model_dir(name), _hf_cache_dir_for(repo_id)):
+        if not root.exists():
+            continue
+        for lock in root.rglob("*.lock"):
+            try:
+                lock.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info(f"Cleared {removed} stale lock file(s) for '{name}'")
+    return removed
+
+
+def _hf_cache_dir_for(repo_id: str) -> Path:
+    """Path where huggingface_hub stores blobs for a given repo, given our HF_HOME."""
+    safe = "models--" + repo_id.replace("/", "--")
+    return Path(settings.BASE_DIR / settings.MODELS_DIR) / "hub" / safe
+
+
+def _download_size_bytes(name: str, repo_id: str) -> int:
+    """Total bytes on disk for this model = local_dir + the HF blob cache.
+
+    `snapshot_download(local_dir=...)` writes blobs into the HF cache first and
+    only links them into `local_dir` at the end of the run, so sampling only
+    `local_dir` looks frozen for the entire download. Adding the per-repo hub
+    cache makes the watchdog see real progress.
+    """
+    return _dir_size_bytes(_model_dir(name)) + _dir_size_bytes(_hf_cache_dir_for(repo_id))
+
+
 def _spawn_download(name: str, repo_id: str) -> subprocess.Popen:
     """Run snapshot_download in a child process so we can kill it on stall."""
     local_dir = _model_dir(name)
@@ -68,25 +162,91 @@ def _spawn_download(name: str, repo_id: str) -> subprocess.Popen:
 
     env = os.environ.copy()
     env["HF_HOME"] = str(settings.BASE_DIR / settings.MODELS_DIR)
+    # Force unbuffered stderr so HF log lines reach us in real time.
+    env["PYTHONUNBUFFERED"] = "1"
+    # Bail out of stuck TCP reads in 30s; HF then retries internally.
+    env["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+    # Verbose hf_hub logging via Python logging (newline-terminated, parsable).
+    env["HF_HUB_VERBOSITY"] = "debug"
+    # Disable tqdm's \r-based bars — they block readline() in our stderr pump.
+    env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+    # Configure logging in the child so hf_hub's debug records actually print
+    # to stderr; otherwise verbosity=debug is set but no handler is attached.
     code = (
-        "from huggingface_hub import snapshot_download;"
-        f"snapshot_download(repo_id={repo_id!r}, local_dir={str(local_dir)!r})"
+        f"# {_CHILD_MARKER}\n"
+        "import logging, sys\n"
+        "logging.basicConfig(level=logging.INFO,"
+        " format='%(levelname)s %(name)s: %(message)s', stream=sys.stderr)\n"
+        "from huggingface_hub import snapshot_download\n"
+        f"snapshot_download(repo_id={repo_id!r}, local_dir={str(local_dir)!r},"
+        " max_workers=1)\n"
+        "sys.exit(0)\n"
     )
     return subprocess.Popen(
         [sys.executable, "-c", code],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        # New session → killable as a process group, no inherited signal handlers.
+        start_new_session=True,
     )
 
 
-def _run_with_watchdog(name: str, repo_id: str, post) -> tuple[bool, str | None]:
-    """Run a single download attempt with a stall watchdog. Returns (ok, error)."""
-    local_dir = _model_dir(name)
-    proc = _spawn_download(name, repo_id)
+def _terminate_group(proc: subprocess.Popen) -> None:
+    """Kill the child *and* anything it spawned (HF can spawn helper threads/forks)."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
-    last_size = _dir_size_bytes(local_dir)
+
+def _pump_stderr(name: str, proc: subprocess.Popen, sink: list[str]) -> threading.Thread:
+    """Read child stderr line-by-line, log each line, keep last N lines for the error report."""
+    def _run():
+        if proc.stderr is None:
+            return
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                logger.info(f"[{name}] {line}")
+                sink.append(line)
+                if len(sink) > 50:
+                    del sink[0:len(sink) - 50]
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
+def _run_with_watchdog(name: str, repo_id: str, post, attempt: int) -> tuple[bool, str | None]:
+    """Run a single download attempt with a stall watchdog. Returns (ok, error)."""
+    proc = _spawn_download(name, repo_id)
+    stderr_lines: list[str] = []
+    pump = _pump_stderr(name, proc, stderr_lines)
+
+    last_size = _download_size_bytes(name, repo_id)
     last_growth = time.monotonic()
 
     while True:
@@ -96,22 +256,29 @@ def _run_with_watchdog(name: str, repo_id: str, post) -> tuple[bool, str | None]
         except subprocess.TimeoutExpired:
             pass
 
-        size = _dir_size_bytes(local_dir)
+        size = _download_size_bytes(name, repo_id)
         if size > last_size:
             last_size = size
             last_growth = time.monotonic()
-            post("downloading", bytes_dl=size)
         elif time.monotonic() - last_growth > _STALL_TIMEOUT:
             logger.warning(
                 f"Model '{name}' stalled (no progress for {_STALL_TIMEOUT}s), terminating"
             )
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            post(
+                "downloading",
+                bytes_dl=size,
+                attempt=attempt,
+                note="stalled — restarting",
+            )
+            _terminate_group(proc)
+            pump.join(timeout=2)
             return False, f"download stalled (no progress for {_STALL_TIMEOUT}s)"
+
+        # Heartbeat every poll tick — even if size didn't change — so the UI
+        # and logs see a steady signal during slow blob writes.
+        post("downloading", bytes_dl=size, attempt=attempt)
+
+    pump.join(timeout=5)
 
     if rc == 0:
         try:
@@ -120,13 +287,7 @@ def _run_with_watchdog(name: str, repo_id: str, post) -> tuple[bool, str | None]
             return False, f"could not write sentinel: {e}"
         return True, None
 
-    err_bytes = b""
-    if proc.stderr is not None:
-        try:
-            err_bytes = proc.stderr.read() or b""
-        except Exception:
-            pass
-    err_text = err_bytes.decode(errors="replace").strip()
+    err_text = "\n".join(stderr_lines[-10:]).strip()
     if len(err_text) > 500:
         err_text = "..." + err_text[-500:]
     return False, f"exit code {rc}: {err_text}" if err_text else f"exit code {rc}"
@@ -135,7 +296,14 @@ def _run_with_watchdog(name: str, repo_id: str, post) -> tuple[bool, str | None]
 def _make_status_poster(main_loop: asyncio.AbstractEventLoop, name: str):
     """Build a thread-safe `post(status, ...)` that updates DB + WS bus."""
 
-    async def _update(status: str, error: str | None, bytes_dl: int, bytes_total: int):
+    async def _update(
+        status: str,
+        error: str | None,
+        bytes_dl: int,
+        bytes_total: int,
+        attempt: int | None,
+        note: str | None,
+    ):
         from app.db import AsyncSessionLocal
         from app.models_db import ModelDownload
         from app.jobs.progress_bus import publish_model_progress
@@ -153,11 +321,20 @@ def _make_status_poster(main_loop: asyncio.AbstractEventLoop, name: str):
                 row.error_message = error
                 await session.commit()
 
-        await publish_model_progress(name, status, bytes_dl, bytes_total)
+        await publish_model_progress(
+            name, status, bytes_dl, bytes_total, attempt=attempt, note=note
+        )
 
-    def post(status: str, error: str | None = None, bytes_dl: int = 0, bytes_total: int = 0):
+    def post(
+        status: str,
+        error: str | None = None,
+        bytes_dl: int = 0,
+        bytes_total: int = 0,
+        attempt: int | None = None,
+        note: str | None = None,
+    ):
         future = asyncio.run_coroutine_threadsafe(
-            _update(status, error, bytes_dl, bytes_total), main_loop
+            _update(status, error, bytes_dl, bytes_total, attempt, note), main_loop
         )
         try:
             future.result(timeout=10)
@@ -180,33 +357,55 @@ def _download_worker(main_loop: asyncio.AbstractEventLoop) -> None:
             last_err: str | None = None
 
             for attempt in range(_MAX_ATTEMPTS):
+                attempt_n = attempt + 1
                 wait = _BACKOFF_SECONDS[attempt]
                 if wait:
                     logger.info(
                         f"Retrying '{name}' in {wait}s "
-                        f"(attempt {attempt + 1}/{_MAX_ATTEMPTS})"
+                        f"(attempt {attempt_n}/{_MAX_ATTEMPTS})"
+                    )
+                    post(
+                        "downloading",
+                        bytes_dl=_download_size_bytes(name, repo_id),
+                        attempt=attempt_n,
+                        note=f"retry {attempt_n}/{_MAX_ATTEMPTS} in {wait}s",
                     )
                     time.sleep(wait)
 
-                post("downloading", bytes_dl=_dir_size_bytes(_model_dir(name)))
+                _clean_stale_locks(name, repo_id)
+                dir_size = _download_size_bytes(name, repo_id)
+                start_note = "resuming" if dir_size > 0 else "starting"
+                logger.info(
+                    f"Model '{name}' attempt {attempt_n}/{_MAX_ATTEMPTS} {start_note}"
+                )
+                post(
+                    "downloading",
+                    bytes_dl=dir_size,
+                    attempt=attempt_n,
+                    note=start_note,
+                )
                 try:
-                    ok, err = _run_with_watchdog(name, repo_id, post)
+                    ok, err = _run_with_watchdog(name, repo_id, post, attempt_n)
                 except Exception as exc:
                     ok, err = False, f"{type(exc).__name__}: {exc}"
 
                 if ok:
-                    post("done", bytes_dl=_dir_size_bytes(_model_dir(name)))
+                    post(
+                        "done",
+                        bytes_dl=_download_size_bytes(name, repo_id),
+                        attempt=attempt_n,
+                    )
                     logger.info(f"Model '{name}' ready at {_model_dir(name)}")
                     success = True
                     break
 
                 last_err = err
                 logger.warning(
-                    f"Model '{name}' attempt {attempt + 1}/{_MAX_ATTEMPTS} failed: {err}"
+                    f"Model '{name}' attempt {attempt_n}/{_MAX_ATTEMPTS} failed: {err}"
                 )
 
             if not success:
-                post("failed", error=last_err)
+                post("failed", error=last_err, note=last_err)
                 logger.error(
                     f"Model '{name}' failed after {_MAX_ATTEMPTS} attempts: {last_err}"
                 )
@@ -222,6 +421,10 @@ async def start_background_downloads() -> None:
     from app.db import AsyncSessionLocal
     from app.models_db import ModelDownload
     from sqlalchemy import select
+
+    # Survivors of a previous uvicorn run can still hold fcntl locks on
+    # storage/models/<x>/.cache/huggingface/download/*.lock. Reap them first.
+    _kill_orphan_downloaders()
 
     main_loop = asyncio.get_event_loop()
 
@@ -259,9 +462,26 @@ async def start_background_downloads() -> None:
             t.start()
             _worker_started = True
 
-    for name, repo_id in MODELS_TO_DOWNLOAD.items():
-        if not model_complete(name):
-            _download_queue.put((name, repo_id))
+    pending = [
+        (name, repo_id)
+        for name, repo_id in MODELS_TO_DOWNLOAD.items()
+        if not model_complete(name)
+    ]
+    # Publish queue-position events directly on this loop — calling the threaded
+    # poster from inside the running loop deadlocks until its 10s timeout fires.
+    from app.jobs.progress_bus import publish_model_progress
+    for idx, (name, repo_id) in enumerate(pending, start=1):
+        await publish_model_progress(
+            name,
+            "queued",
+            _download_size_bytes(name, repo_id),
+            0,
+            note=f"queued, position {idx}/{len(pending)}",
+        )
+        logger.info(
+            f"Queued model '{name}' (position {idx}/{len(pending)})"
+        )
+        _download_queue.put((name, repo_id))
 
     asyncio.create_task(_mark_whisper_ready())
 

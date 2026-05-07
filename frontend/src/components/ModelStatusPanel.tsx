@@ -1,8 +1,42 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, CheckCircle, XCircle, Loader, Clock } from "lucide-react";
 import { useModelStatus } from "../hooks/useModelStatus";
 import { fmtBytes } from "../lib/utils";
 import { cn } from "../lib/utils";
+
+type Sample = { t: number; bytes: number };
+
+function useSpeed(name: string, status: string, bytes: number) {
+  const lastRef = useRef<Sample | null>(null);
+  const [speed, setSpeed] = useState<number>(0); // bytes/sec
+
+  useEffect(() => {
+    if (status !== "downloading") {
+      lastRef.current = null;
+      setSpeed(0);
+      return;
+    }
+    const now = Date.now();
+    const prev = lastRef.current;
+    if (prev && now > prev.t && bytes >= prev.bytes) {
+      const dt = (now - prev.t) / 1000;
+      const db = bytes - prev.bytes;
+      // smooth slightly: blend new sample with previous speed
+      const inst = db / dt;
+      setSpeed((s) => (s > 0 ? s * 0.5 + inst * 0.5 : inst));
+    }
+    lastRef.current = { t: now, bytes };
+  }, [name, status, bytes]);
+
+  return speed;
+}
+
+function fmtEta(seconds: number): string {
+  if (!isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${(seconds / 3600).toFixed(1)}h`;
+}
 
 const MODEL_LABELS: Record<string, string> = {
   qwen_lid: "Qwen3-ASR-0.6B (Language ID)",
@@ -57,48 +91,90 @@ export function ModelStatusPanel() {
           {models.length === 0 && (
             <p className="text-sm text-muted-foreground">No models tracked yet.</p>
           )}
-          {models.map((m) => {
-            const pct = m.bytes_total > 0 ? Math.round((m.bytes_downloaded / m.bytes_total) * 100) : 0;
-            return (
-              <div key={m.name}>
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm truncate">{MODEL_LABELS[m.name] ?? m.name}</span>
-                  <span className={cn(
-                    "text-xs ml-2 shrink-0",
-                    m.status === "done" && "text-green-500",
-                    m.status === "failed" && "text-destructive",
-                    m.status === "downloading" && "text-primary",
-                    m.status === "queued" && "text-muted-foreground",
-                  )}>
-                    {m.status === "downloading" && m.bytes_total > 0
-                      ? `${fmtBytes(m.bytes_downloaded)} / ${fmtBytes(m.bytes_total)}`
-                      : m.status}
-                  </span>
-                </div>
-                <div className="h-1.5 rounded-full bg-muted overflow-hidden">
-                  <div
-                    className={cn(
-                      "h-full rounded-full transition-all duration-500",
-                      m.status === "done" && "bg-green-500",
-                      m.status === "failed" && "bg-destructive",
-                      m.status === "downloading" && "bg-primary",
-                      m.status === "queued" && "bg-muted-foreground/40",
-                    )}
-                    style={{ width: m.status === "done" ? "100%" : `${pct}%` }}
-                  />
-                </div>
-                {m.error_message && (
-                  <p className="text-xs text-destructive mt-0.5">{m.error_message}</p>
-                )}
-              </div>
-            );
-          })}
+          {models.map((m) => (
+            <ModelRow key={m.name} model={m as ModelRowProps["model"]} />
+          ))}
           {!allDone && (
             <p className="text-xs text-muted-foreground">
               Total model size: ~20 GB. Uploads will queue until required models are ready.
             </p>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+interface ModelRowProps {
+  model: {
+    name: string;
+    status: string;
+    bytes_downloaded: number;
+    bytes_total: number;
+    error_message: string | null;
+    attempt?: number;
+    note?: string;
+  };
+}
+
+function ModelRow({ model: m }: ModelRowProps) {
+  const speed = useSpeed(m.name, m.status, m.bytes_downloaded);
+  const pct = m.bytes_total > 0 ? Math.round((m.bytes_downloaded / m.bytes_total) * 100) : 0;
+  const remaining = m.bytes_total > 0 ? m.bytes_total - m.bytes_downloaded : 0;
+  const etaSeconds = speed > 0 && remaining > 0 ? remaining / speed : 0;
+
+  let rightLabel: string;
+  if (m.status === "downloading" && m.bytes_total > 0) {
+    rightLabel = `${fmtBytes(m.bytes_downloaded)} / ${fmtBytes(m.bytes_total)}`;
+  } else if (m.status === "downloading" && m.bytes_downloaded > 0) {
+    rightLabel = fmtBytes(m.bytes_downloaded);
+  } else {
+    rightLabel = m.status;
+  }
+  if (m.status === "downloading" && m.attempt && m.attempt > 1) {
+    rightLabel += ` (attempt ${m.attempt}/4)`;
+  }
+
+  const speedLine =
+    m.status === "downloading" && speed > 0
+      ? `${fmtBytes(speed)}/s${etaSeconds > 0 ? ` · ETA ${fmtEta(etaSeconds)}` : ""}`
+      : "";
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-sm truncate">{MODEL_LABELS[m.name] ?? m.name}</span>
+        <span
+          className={cn(
+            "text-xs ml-2 shrink-0",
+            m.status === "done" && "text-green-500",
+            m.status === "failed" && "text-destructive",
+            m.status === "downloading" && "text-primary",
+            m.status === "queued" && "text-muted-foreground",
+          )}
+        >
+          {rightLabel}
+        </span>
+      </div>
+      <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+        <div
+          className={cn(
+            "h-full rounded-full transition-all duration-500",
+            m.status === "done" && "bg-green-500",
+            m.status === "failed" && "bg-destructive",
+            m.status === "downloading" && "bg-primary",
+            m.status === "queued" && "bg-muted-foreground/40",
+          )}
+          style={{ width: m.status === "done" ? "100%" : `${pct}%` }}
+        />
+      </div>
+      {(m.note || speedLine) && (
+        <p className="text-xs text-muted-foreground mt-0.5">
+          {[m.note, speedLine].filter(Boolean).join(" · ")}
+        </p>
+      )}
+      {m.error_message && (
+        <p className="text-xs text-destructive mt-0.5">{m.error_message}</p>
       )}
     </div>
   );

@@ -43,15 +43,28 @@ async def publish_job_progress(job_id: str, event: dict) -> None:
         _job_subscribers.get(job_id, set()).discard(q)
 
 
-async def publish_model_progress(name: str, status: str, bytes_dl: int, bytes_total: int) -> None:
+async def publish_model_progress(
+    name: str,
+    status: str,
+    bytes_dl: int,
+    bytes_total: int,
+    *,
+    attempt: int | None = None,
+    note: str | None = None,
+) -> None:
     percent = int(bytes_dl / bytes_total * 100) if bytes_total else 0
-    payload = json.dumps({
+    event: dict = {
         "name": name,
         "status": status,
         "bytes_downloaded": bytes_dl,
         "bytes_total": bytes_total,
         "percent": percent,
-    })
+    }
+    if attempt is not None:
+        event["attempt"] = attempt
+    if note is not None:
+        event["note"] = note
+    payload = json.dumps(event)
     dead = set()
     for q in _model_subscribers:
         try:

@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     # Serving built UI from FastAPI
     SHRAVANA_SERVE_UI: bool = False
 
+    # Server port (consumed by backend/run.py and the Vite dev proxy)
+    BACKEND_PORT: int = 8000
+    BACKEND_HOST: str = "127.0.0.1"
+
     class Config:
         env_file = str(Path(__file__).parent.parent / ".env")
         env_file_encoding = "utf-8"
