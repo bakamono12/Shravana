@@ -1,10 +1,22 @@
 """Lazy singleton model registry — loads each model only when first requested."""
 from __future__ import annotations
 import threading
+from pathlib import Path
 from typing import Optional
 
 from app.config import settings
 from app.ml.base import ModelNotReady
+
+
+# Sentinel written to a model directory only after a download fully succeeds.
+# Presence == complete; absence == missing or partial (must (re)download).
+SENTINEL_FILE = ".shravana_complete"
+
+
+def model_complete(name: str) -> bool:
+    """True iff the model's completion sentinel file is present on disk."""
+    sentinel = Path(settings.BASE_DIR / settings.MODELS_DIR) / name / SENTINEL_FILE
+    return sentinel.exists()
 
 
 _lock = threading.Lock()
@@ -82,17 +94,10 @@ def _remote_proxy_for(name: str):
 # ------------------------------------------------------------------ #
 
 def _is_downloaded(name: str) -> bool:
-    """Check whether model files are present on disk."""
+    """Check whether the model's download sentinel is present on disk."""
     if name == "whisper_turbo":
         return True
-    from pathlib import Path
-    local_dir = Path(settings.BASE_DIR / settings.MODELS_DIR) / name
-    if not local_dir.exists():
-        return False
-    return any(
-        f for f in local_dir.rglob("*")
-        if f.is_file() and not f.name.startswith(".")
-    )
+    return model_complete(name)
 
 
 def get(name: str):
