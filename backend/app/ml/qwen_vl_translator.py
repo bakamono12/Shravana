@@ -72,12 +72,12 @@ class QwenVLTranslator(BaseTranslator):
         self._processor = None
 
     def load(self) -> None:
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         import torch
 
         logger.info(f"Loading Qwen2.5-VL from {self.model_id}")
         self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
-        self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_id,
             torch_dtype="auto",
             device_map="auto",
