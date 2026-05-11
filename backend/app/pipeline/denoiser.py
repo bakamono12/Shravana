@@ -44,7 +44,13 @@ def denoise(
             # Scale demucs (0-100) to 0-60 of overall denoise
             on_progress("demucs", int(pct * 0.6))
 
-    vocals_wav = _run_demucs(raw_wav, output_dir, on_progress=_demucs_progress)
+    try:
+        import torch as _torch
+        _device = "cuda" if _torch.cuda.is_available() else "cpu"
+    except ImportError:
+        _device = "cpu"
+
+    vocals_wav = _run_demucs(raw_wav, output_dir, on_progress=_demucs_progress, device=_device)
     if on_progress:
         on_progress("noisereduce", 70)
     clean_wav = _run_noisereduce(vocals_wav, str(Path(output_dir) / "clean.wav"))
@@ -133,12 +139,15 @@ def _run_vad(clean_wav: str) -> List[Tuple[float, float]]:
         import soundfile as sf
         import numpy as np
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
         model, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
             trust_repo=True,
         )
+        model = model.to(device)
         get_speech_timestamps = utils[0]
 
         # Load audio with soundfile to avoid torchaudio >= 2.9 breakage
@@ -148,7 +157,7 @@ def _run_vad(clean_wav: str) -> List[Tuple[float, float]]:
         if sr != 16000:
             import librosa
             audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=16000)
-        wav = torch.from_numpy(audio_np)
+        wav = torch.from_numpy(audio_np).to(device)
 
         timestamps = get_speech_timestamps(wav, model, sampling_rate=16000)
         return [(t["start"] / 16000.0, t["end"] / 16000.0) for t in timestamps]

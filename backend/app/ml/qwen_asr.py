@@ -34,10 +34,13 @@ class QwenASRModel(BaseSTTModel):
         local_dir = Path(settings.BASE_DIR / settings.MODELS_DIR) / key
         load_path = str(local_dir) if local_dir.exists() and any(local_dir.rglob("*.safetensors")) else self.model_id
 
+        from app.ml.base import get_device
+        device = get_device()
+        dtype = torch.float16 if device == "cuda" else torch.float32
         self._model = Qwen3ASRModel.from_pretrained(
             load_path,
-            dtype=torch.float32,
-            device_map="cpu",
+            dtype=dtype,
+            device_map=device,
             max_inference_batch_size=1,
             max_new_tokens=256,
         )

@@ -16,12 +16,18 @@ class DemucsSeparator:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+
         subprocess.run(
             [
                 sys.executable, "-m", "demucs",
                 "--two-stems=vocals",
                 "--name", self.model_name,
-                "--device", "cpu",
+                "--device", device,
                 "--out", str(out),
                 audio_path,
             ],

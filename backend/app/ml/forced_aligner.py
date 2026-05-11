@@ -11,8 +11,10 @@ class ForcedAlignerModel:
 
     def load(self) -> None:
         from transformers import AutoProcessor, AutoModel
+        from app.ml.base import get_device
+        self._device = get_device()
         self._processor = AutoProcessor.from_pretrained(self.model_id)
-        self._model = AutoModel.from_pretrained(self.model_id)
+        self._model = AutoModel.from_pretrained(self.model_id).to(self._device)
         self._model.eval()
 
     def align(self, audio_path: str, segments: List[TranscriptSegment]) -> List[TranscriptSegment]:
@@ -38,6 +40,7 @@ class ForcedAlignerModel:
                     sampling_rate=16000,
                     return_tensors="pt",
                 )
+                inputs = {k: v.to(self._device) for k, v in inputs.items()}
                 with torch.no_grad():
                     out = self._model(**inputs)
                 word_timestamps = self._processor.post_process_word_timestamps(out, seg.start, seg.end)

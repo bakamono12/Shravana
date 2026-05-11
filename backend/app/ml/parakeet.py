@@ -10,7 +10,10 @@ class ParakeetModel(BaseSTTModel):
 
     def load(self) -> None:
         import nemo.collections.asr as nemo_asr  # noqa
+        import torch
         self._model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.model_id)
+        if torch.cuda.is_available():
+            self._model = self._model.cuda()
         self._model.eval()
 
     def transcribe(self, audio_path: str) -> List[TranscriptSegment]:

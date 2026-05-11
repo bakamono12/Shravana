@@ -10,8 +10,10 @@ class WhisperTurboModel(BaseSTTModel):
 
     def load(self) -> None:
         from faster_whisper import WhisperModel
-        # CPU with INT8 quantization for speed
-        self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+        from app.ml.base import get_device
+        device = get_device()
+        compute_type = "float16" if device == "cuda" else "int8"
+        self._model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
 
     def transcribe(self, audio_path: str, language: str | None = None) -> List[TranscriptSegment]:
         if self._model is None:
