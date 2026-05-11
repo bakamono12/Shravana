@@ -3,6 +3,7 @@ import { Download, Eye } from "lucide-react";
 
 interface Props {
   jobId: string;
+  lang?: string;
   hideDownloads?: boolean;
 }
 
@@ -27,17 +28,20 @@ function parseSrt(srt: string): Block[] {
   return blocks;
 }
 
-export function SubtitlePreview({ jobId, hideDownloads }: Props) {
+export function SubtitlePreview({ jobId, lang, hideDownloads }: Props) {
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    fetch(`/api/subtitles/${jobId}/srt`)
+    const url = `/api/subtitles/${jobId}/srt${lang ? `?lang=${lang}` : ""}`;
+    setLoading(true);
+    setError(false);
+    fetch(url)
       .then((r) => (r.ok ? r.text() : Promise.reject()))
       .then((text) => { setBlocks(parseSrt(text)); setLoading(false); })
       .catch(() => { setError(true); setLoading(false); });
-  }, [jobId]);
+  }, [jobId, lang]);
 
   if (loading) return <div className="text-sm text-muted-foreground animate-pulse">Loading preview…</div>;
   if (error) return <div className="text-sm text-muted-foreground">Preview unavailable.</div>;
@@ -65,7 +69,7 @@ export function SubtitlePreview({ jobId, hideDownloads }: Props) {
           {["srt", "vtt"].map((fmt) => (
             <a
               key={fmt}
-              href={`/api/subtitles/${jobId}/${fmt}`}
+              href={`/api/subtitles/${jobId}/${fmt}${lang ? `?lang=${lang}` : ""}`}
               download
               className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
             >
@@ -73,7 +77,7 @@ export function SubtitlePreview({ jobId, hideDownloads }: Props) {
             </a>
           ))}
           <a
-            href={`/api/subtitles/${jobId}/json`}
+            href={`/api/subtitles/${jobId}/json${lang ? `?lang=${lang}` : ""}`}
             download
             className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground hover:bg-muted transition-colors"
           >

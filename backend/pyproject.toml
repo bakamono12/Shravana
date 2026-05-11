@@ -38,6 +38,7 @@ dependencies = [
     # qwen3_asr architecture (Qwen3ASRForConditionalGeneration).
     # Do NOT pin the git-HEAD transformers here; it lacks qwen3_asr support.
     "qwen-asr>=0.0.6",
+    "qwen-vl-utils>=0.0.14",
     "huggingface-hub>=0.22.0",
     "tqdm>=4.65.0,<5.0.0",
     "accelerate>=0.27.0",

@@ -283,11 +283,17 @@ export function JobDetail() {
 
       {/* Media + subtitle preview */}
       {job.status === "done" && jobId && (
-        <MediaPreview jobId={jobId} detectedLanguage={job.detected_language} />
+        <MediaPreview
+          jobId={jobId}
+          detectedLanguage={job.detected_language}
+          targetLanguage={job.target_language}
+          targetLanguageName={job.target_language ? (supportedLangs[job.target_language]?.name ?? job.target_language) : undefined}
+          translationDone={job.translation_status === "done"}
+        />
       )}
 
-      {/* Retro-translate panel */}
-      {job.status === "done" && jobId && (
+      {/* Retro-translate panel — hidden when translation already completed */}
+      {job.status === "done" && jobId && !(job.translate && job.translation_status === "done") && (
         <div className="bg-card border rounded-xl p-4 space-y-3">
           <h3 className="text-sm font-medium flex items-center gap-2">
             <Languages size={16} className="text-primary" />

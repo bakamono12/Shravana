@@ -6,12 +6,18 @@ import { cn } from "../lib/utils";
 interface Props {
   jobId: string;
   detectedLanguage?: string | null;
+  targetLanguage?: string | null;
+  targetLanguageName?: string;
+  translationDone?: boolean;
 }
 
-export function MediaPreview({ jobId, detectedLanguage }: Props) {
+export function MediaPreview({ jobId, detectedLanguage, targetLanguage, targetLanguageName, translationDone }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isAudioOnly, setIsAudioOnly] = useState(false);
   const [showBlocks, setShowBlocks] = useState(false);
+  const hasTranslation = !!(translationDone && targetLanguage);
+  const [selectedLang, setSelectedLang] = useState<string | null>(null);
+  const activeLang = selectedLang ?? detectedLanguage ?? null;
 
   const handleMetadata = () => {
     if (videoRef.current && videoRef.current.videoHeight === 0) {
@@ -25,6 +31,30 @@ export function MediaPreview({ jobId, detectedLanguage }: Props) {
         <Eye size={15} className="text-muted-foreground" />
         <span className="text-sm font-medium">Preview</span>
       </div>
+
+      {/* Language toggle */}
+      {hasTranslation && (
+        <div className="flex gap-1 rounded-lg border border-input p-0.5 w-fit text-sm">
+          <button
+            onClick={() => setSelectedLang(detectedLanguage ?? null)}
+            className={cn(
+              "px-3 py-1 rounded-md transition-colors",
+              activeLang !== targetLanguage ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {detectedLanguage ? detectedLanguage.toUpperCase() : "Original"}
+          </button>
+          <button
+            onClick={() => setSelectedLang(targetLanguage!)}
+            className={cn(
+              "px-3 py-1 rounded-md transition-colors",
+              activeLang === targetLanguage ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {targetLanguageName ?? targetLanguage!.toUpperCase()}
+          </button>
+        </div>
+      )}
 
       {/* Player */}
       <div className={cn(
@@ -43,9 +73,9 @@ export function MediaPreview({ jobId, detectedLanguage }: Props) {
           <track
             default
             kind="subtitles"
-            label="Subtitles"
-            srcLang={detectedLanguage ?? "en"}
-            src={`/api/subtitles/${jobId}/vtt`}
+            label={activeLang ? activeLang.toUpperCase() : "Subtitles"}
+            srcLang={activeLang ?? "en"}
+            src={`/api/subtitles/${jobId}/vtt${activeLang ? `?lang=${activeLang}` : ""}`}
           />
         </video>
       </div>
@@ -55,15 +85,16 @@ export function MediaPreview({ jobId, detectedLanguage }: Props) {
         {(["srt", "vtt"] as const).map((fmt) => (
           <a
             key={fmt}
-            href={`/api/subtitles/${jobId}/${fmt}`}
+            href={`/api/subtitles/${jobId}/${fmt}${activeLang ? `?lang=${activeLang}` : ""}`}
             download
             className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
           >
             <Download size={14} /> Download {fmt.toUpperCase()}
+            {activeLang && <span className="opacity-70 text-xs ml-0.5">({activeLang.toUpperCase()})</span>}
           </a>
         ))}
         <a
-          href={`/api/subtitles/${jobId}/json`}
+          href={`/api/subtitles/${jobId}/json${activeLang ? `?lang=${activeLang}` : ""}`}
           download
           className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground hover:bg-muted transition-colors"
         >
@@ -82,7 +113,7 @@ export function MediaPreview({ jobId, detectedLanguage }: Props) {
         </button>
         {showBlocks && (
           <div className="mt-3">
-            <SubtitlePreview jobId={jobId} hideDownloads />
+            <SubtitlePreview jobId={jobId} lang={activeLang ?? undefined} hideDownloads />
           </div>
         )}
       </div>
