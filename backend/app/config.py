@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Translation models
     SEAMLESS_MODEL_ID: str = "facebook/seamless-m4t-v2-large"
-    QWEN_VL_MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    QWEN_VL_MODEL_ID: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     # Translation pipeline behaviour
     TRANSLATION_CONTEXT_WINDOW: int = 4       # rolling translated chunks kept in history
@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     CONTEXT_KEYFRAME_INTERVAL_S: int = 30     # seconds between keyframes for context build
     LLM_CALL_TIMEOUT_S: int = 30
     LLM_MAX_RETRIES: int = 2
+
+    # VLM optimization
+    VLM_USE_4BIT: bool = True       # 4-bit NF4 quant on CUDA (~2x VRAM saving); ignored on CPU
+    VLM_MAX_PIXELS: int = 200704    # 256 × 28 × 28 visual patches — caps vision encoding cost
 
     # Language routing
     LID_CONFIDENCE_THRESHOLD: float = 0.70
