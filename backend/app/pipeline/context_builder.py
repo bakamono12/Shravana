@@ -59,7 +59,7 @@ def _sample_keyframes(video_path: str, job_dir: str, interval_s: int) -> list[Pa
 
 
 def _describe_frames_with_vlm(frames: list[Path]) -> str:
-    """Ask Qwen2.5-VL for a one-sentence description per frame; join results."""
+    """Send all keyframes in one multi-image VLM call; return joined descriptions."""
     if not frames:
         return ""
     try:
@@ -69,14 +69,45 @@ def _describe_frames_with_vlm(frames: list[Path]) -> str:
         logger.warning(f"VLM not available for frame description: {exc}")
         return ""
 
+    capped = frames[:8]
+
+    if len(capped) > 1:
+        # Single multi-image call — reduces N serial round-trips to 1.
+        numbered_prompt = (
+            f"I will show you {len(capped)} video frames in order. "
+            "For each frame write ONE sentence: setting, activity, subject matter. "
+            f"Number your answers 1 through {len(capped)}. No other text."
+        )
+        try:
+            raw = vlm._call_model(
+                source_text=numbered_prompt,
+                system_prompt="You are a concise scene analyst.",
+                history_text="",
+                frames=capped,
+                max_new_tokens=64 * len(capped),
+            )
+            lines = [
+                re.sub(r"^\d+[.)]\s*", "", line).strip()
+                for line in raw.splitlines()
+                if re.match(r"^\d+[.)]", line.strip())
+            ]
+            if lines:
+                return " | ".join(lines)
+            # Model didn't number answers — return the raw text as-is.
+            return raw.strip()
+        except Exception as exc:
+            logger.warning(f"Batched frame description failed ({exc}), falling back to serial")
+
+    # Serial fallback: one frame at a time (also handles the single-frame case).
     descriptions: list[str] = []
-    for frame in frames[:8]:  # cap to avoid excessive calls
+    for frame in capped:
         try:
             desc = vlm._call_model(
                 source_text="Describe this scene in one sentence: setting, activity, and apparent subject matter.",
                 system_prompt="You are a concise scene analyst. Answer in one sentence only.",
                 history_text="",
                 frames=[frame],
+                max_new_tokens=64,
             )
             descriptions.append(desc.strip())
         except Exception as exc:
@@ -117,6 +148,7 @@ def _extract_context_from_transcript(
             system_prompt=system_prompt,
             history_text="",
             frames=None,
+            max_new_tokens=300,
         )
         # Extract JSON even if the model wraps it in markdown fences
         match = re.search(r"\{.*\}", raw, re.DOTALL)

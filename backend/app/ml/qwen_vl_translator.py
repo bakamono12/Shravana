@@ -15,9 +15,10 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from app.config import settings
 from app.ml.base import (
     BaseTranslator, TranscriptSegment, TranslatedSegment, WordTimestamp,
-    ContextBundle,
+    ContextBundle, get_device,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,12 +77,41 @@ class QwenVLTranslator(BaseTranslator):
         import torch
 
         logger.info(f"Loading Qwen2.5-VL from {self.model_id}")
-        self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+            max_pixels=settings.VLM_MAX_PIXELS,
+        )
+
+        quantization_config = None
+        if settings.VLM_USE_4BIT and get_device() == "cuda":
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                logger.info("Using 4-bit NF4 quantization (bitsandbytes)")
+            except ImportError:
+                logger.warning(
+                    "VLM_USE_4BIT=True but bitsandbytes is not installed; "
+                    "falling back to full precision. Install with: pip install bitsandbytes>=0.43.0"
+                )
+
+        load_kwargs: dict = {
+            "torch_dtype": torch.float16 if get_device() == "cuda" else "auto",
+            "device_map": "auto",
+            "trust_remote_code": True,
+        }
+        if quantization_config is not None:
+            load_kwargs["quantization_config"] = quantization_config
+
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_id,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
+            **load_kwargs,
         )
         self._model.eval()
         logger.info("Qwen2.5-VL loaded")
@@ -112,6 +142,7 @@ class QwenVLTranslator(BaseTranslator):
                     system_prompt=system_prompt,
                     history_text=history_text,
                     frames=frames,
+                    max_new_tokens=256,
                 )
             except Exception as exc:
                 logger.warning(f"Qwen2.5-VL translate segment failed ({exc}), using source text")
@@ -162,6 +193,7 @@ class QwenVLTranslator(BaseTranslator):
                 system_prompt=system_prompt,
                 history_text="",
                 frames=None,
+                max_new_tokens=256,
             )
         except Exception as exc:
             logger.warning(f"Qwen2.5-VL refine failed ({exc}), keeping first pass")
@@ -173,6 +205,7 @@ class QwenVLTranslator(BaseTranslator):
         system_prompt: str,
         history_text: str,
         frames: Optional[List[Path]],
+        max_new_tokens: int = 256,
     ) -> str:
         from qwen_vl_utils import process_vision_info
         import torch
@@ -207,7 +240,7 @@ class QwenVLTranslator(BaseTranslator):
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
 
