@@ -188,7 +188,7 @@ Implement `VideoContextExtractor` — extends audio extractor with keyframe anal
 - Return list of frame file paths
 
 **`describe_keyframes(frame_paths: list[str]) -> str`**
-- For each frame, send to a VLM (Qwen2-VL-7B via local Ollama if available, else skip)
+- For each frame, send to a VLM (Qwen2.5-VL-3B-Instruct via HuggingFace, 4-bit quant if available, else skip)
 - Prompt: `"Describe this scene in one sentence: setting, activity, and apparent domain/subject matter"`
 - Concatenate descriptions into a single scene summary string
 - If VLM not available: return `None` and log a warning — video falls back to audio-only context
@@ -399,9 +399,8 @@ class TranslationConfig:
     enable_diarization: bool = True
     
     # VLM for keyframe analysis (video only)
-    vlm_endpoint: str = "http://localhost:11434/api/chat"
-    vlm_model: str = "qwen2-vl:7b"
-    enable_vlm: bool = False    # off by default unless user sets up the model
+    vlm_model: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    enable_vlm: bool = True
     
     # Pipeline behaviour
     enable_llm_refinement: bool = True   # set False to use IndicTrans2 only (faster)
