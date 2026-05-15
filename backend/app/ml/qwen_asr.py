@@ -27,7 +27,6 @@ class QwenASRModel(BaseSTTModel):
         repo_slug = self.model_id.split("/")[-1].lower().replace("-", "_").replace(".", "_")
         # Map known repo slugs to registry key names used on disk
         _SLUG_TO_KEY = {
-            "qwen3_asr_0_6b": "qwen_lid",
             "qwen3_asr_1_7b": "qwen3_asr",
         }
         key = _SLUG_TO_KEY.get(repo_slug, repo_slug)

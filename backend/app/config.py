@@ -18,15 +18,10 @@ class Settings(BaseSettings):
     AUDIO_SAMPLE_RATE: int = 16000
 
     # Models
-    PARAKEET_MODEL_ID: str = "nvidia/parakeet-tdt-1.1b"
-    QWEN_LID_MODEL_ID: str = "Qwen/Qwen3-ASR-0.6B"
     QWEN_ASR_MODEL_ID: str = "Qwen/Qwen3-ASR-1.7B"
-    WHISPER_MODEL_SIZE: str = "large-v3-turbo"
-    FORCED_ALIGNER_MODEL_ID: str = "Qwen/Qwen3-ForcedAligner-0.6B"
     DEMUCS_MODEL_NAME: str = "htdemucs"
 
     # Translation models
-    SEAMLESS_MODEL_ID: str = "facebook/seamless-m4t-v2-large"
     QWEN_VL_MODEL_ID: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     # Translation pipeline behaviour

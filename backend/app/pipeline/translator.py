@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from app.config import settings
 from app.ml.base import ContextBundle, TranscriptSegment, TranslatedSegment, WordTimestamp
@@ -18,19 +18,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-# ------------------------------------------------------------------ #
-# Mode selection                                                       #
-# ------------------------------------------------------------------ #
-
-def select_translator_mode(filename: str, translator_mode_override: str | None) -> Literal["vlm", "audio"]:
-    """Auto-detect based on file extension; honor user override."""
-    if translator_mode_override in ("vlm", "audio"):
-        return translator_mode_override  # type: ignore[return-value]
-
-    _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
-    ext = Path(filename).suffix.lower()
-    return "vlm" if ext in _VIDEO_EXTS else "audio"
 
 
 # ------------------------------------------------------------------ #
@@ -93,7 +80,6 @@ def translate_unit(
     video_path: str | None,
     source_lang: str,
     target_lang: str,
-    mode: Literal["vlm", "audio"],
     history: list[TranslatedSegment],
     prev_text: str,
     next_text: str,
@@ -101,13 +87,16 @@ def translate_unit(
     glossary: "Glossary | None",
     enable_refinement: bool,
 ) -> tuple[str, str]:
-    """Translate one semantic unit. Returns (first_pass, final_translated_text)."""
+    """Translate one semantic unit. Returns (first_pass, final_translated_text).
+
+    Qwen2.5-VL handles all translation: with keyframes when video_path is given,
+    text-only when audio-only.
+    """
     from app.ml.registry import get as registry_get
     from app.ml.base import ModelNotReady
 
     glossary_text = glossary.as_prompt_text() if glossary else ""
 
-    # ---- Build a list of TranscriptSegment from unit source text (single synthetic segment)
     seg = TranscriptSegment(
         text=unit.source_text,
         start=unit.start_time,
@@ -117,51 +106,30 @@ def translate_unit(
 
     # ---- First pass ----
     first_pass_text = unit.source_text  # fallback: keep source
+    try:
+        vlm = registry_get("qwen2_5_vl")
+        frames = extract_keyframes(
+            video_path, unit.start_time, unit.end_time,
+            n=settings.VLM_KEYFRAMES_PER_CHUNK,
+        ) if video_path else []
+        results = vlm.translate(
+            segments=[seg],
+            source_lang=source_lang,
+            target_lang=target_lang,
+            history=history,
+            audio_path=None,
+            frames=frames or None,
+            context=context,
+            glossary_text=glossary_text,
+        )
+        if results:
+            first_pass_text = results[0].text
+    except ModelNotReady:
+        raise
+    except Exception as exc:
+        logger.warning(f"VLM first-pass failed for unit {unit.sequence}: {exc}")
 
-    if mode == "vlm":
-        try:
-            vlm = registry_get("qwen2_5_vl")
-            frames = extract_keyframes(
-                video_path or "", unit.start_time, unit.end_time,
-                n=settings.VLM_KEYFRAMES_PER_CHUNK,
-            ) if video_path else []
-            results = vlm.translate(
-                segments=[seg],
-                source_lang=source_lang,
-                target_lang=target_lang,
-                history=history,
-                audio_path=None,
-                frames=frames or None,
-                context=context,
-                glossary_text=glossary_text,
-            )
-            if results:
-                first_pass_text = results[0].text
-        except ModelNotReady:
-            raise
-        except Exception as exc:
-            logger.warning(f"VLM first-pass failed for unit {unit.sequence}: {exc}")
-
-    else:  # audio mode
-        try:
-            seamless = registry_get("seamless_v2")
-            results = seamless.translate(
-                segments=[seg],
-                source_lang=source_lang,
-                target_lang=target_lang,
-                history=history,
-                audio_path=None,  # no chunk-level audio path at this stage
-                context=context,
-                glossary_text=glossary_text,
-            )
-            if results:
-                first_pass_text = results[0].text
-        except ModelNotReady:
-            raise
-        except Exception as exc:
-            logger.warning(f"Seamless first-pass failed for unit {unit.sequence}: {exc}")
-
-    # ---- Refinement pass (Qwen2.5-VL text-only) ----
+    # ---- Refinement pass (text-only) ----
     final_text = first_pass_text
     if enable_refinement:
         try:

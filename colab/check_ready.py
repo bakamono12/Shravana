@@ -97,15 +97,6 @@ def _qwen_vl_utils():
         return False, 'pip install "qwen-vl-utils>=0.0.14"'
 
 
-@_check("faster-whisper")
-def _faster_whisper():
-    try:
-        import faster_whisper  # noqa: F401
-        return True, "ok"
-    except ImportError:
-        return False, "not installed"
-
-
 @_check("backend package (app.config)")
 def _backend():
     try:
@@ -120,7 +111,7 @@ def _backend():
 def _models():
     if not MODELS_DIR.exists():
         return False, f"{MODELS_DIR} missing — run Cell 6"
-    names = ["qwen_lid", "qwen3_asr", "seamless_v2", "qwen2_5_vl"]
+    names = ["qwen3_asr", "qwen2_5_vl"]
     missing = [n for n in names if not any((MODELS_DIR / n).rglob("*.safetensors"))]
     if missing:
         return False, f"missing: {', '.join(missing)}"

@@ -8,6 +8,6 @@ router = APIRouter(tags=["translation"])
 async def list_languages() -> dict:
     """Return all supported translation target languages for the frontend dropdown."""
     return {
-        code: {"name": info.name, "seamless": info.seamless, "vlm": info.vlm}
+        code: {"name": info.name}
         for code, info in SUPPORTED_LANGUAGES.items()
     }

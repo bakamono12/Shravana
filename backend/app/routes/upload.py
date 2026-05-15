@@ -53,9 +53,6 @@ async def upload_file(
     if target_language and not is_supported(target_language):
         raise HTTPException(400, f"Unsupported target language '{target_language}'. See /api/translation/languages for supported codes.")
 
-    if translator_mode and translator_mode not in ("vlm", "audio"):
-        raise HTTPException(400, "translator_mode must be 'vlm' or 'audio'")
-
     job = Job(
         filename=safe_name,
         video_path="",

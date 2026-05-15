@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 MODELS_TO_DOWNLOAD: dict[str, str] = {
     name: cfg["repo_id"]
     for name, cfg in MODEL_CONFIGS.items()
-    if not cfg["repo_id"].startswith("faster-whisper/")
+    if cfg["repo_id"]  # all models are HF downloads
 }
 
 # Tuning
@@ -483,26 +483,3 @@ async def start_background_downloads() -> None:
         )
         _download_queue.put((name, repo_id))
 
-    asyncio.create_task(_mark_whisper_ready())
-
-
-async def _mark_whisper_ready() -> None:
-    from app.db import AsyncSessionLocal
-    from app.models_db import ModelDownload
-    from sqlalchemy import select
-
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(ModelDownload).where(ModelDownload.name == "whisper_turbo")
-        )
-        row = result.scalar_one_or_none()
-        if row is None:
-            row = ModelDownload(
-                name="whisper_turbo",
-                repo_id=f"faster-whisper/{settings.WHISPER_MODEL_SIZE}",
-                status="done",
-            )
-            session.add(row)
-        elif row.status != "done":
-            row.status = "done"
-        await session.commit()

@@ -14,7 +14,6 @@ def run_translation_compute(
     source_segments,            # List[TranscriptSegment] — already reassembled
     source_lang: str,
     target_lang: str,
-    translator_mode: str,       # "vlm" | "audio"
     enable_refinement: bool,
     user_glossary_text: str,    # raw user glossary string (may be empty)
     video_path: Optional[str],
@@ -40,7 +39,7 @@ def run_translation_compute(
     from app.pipeline.translator import translate_unit
     from app.pipeline.translation_reassembler import distribute_translation_to_segments
 
-    is_video = translator_mode == "vlm"
+    is_video = bool(video_path)
 
     seg_dicts = [
         {"text": s.text, "start": s.start, "end": s.end}
@@ -92,7 +91,6 @@ def run_translation_compute(
                 unit,
                 video_path if is_video else None,
                 source_lang, target_lang,
-                translator_mode,
                 history, prev_text, next_text,
                 context, glossary, enable_refinement,
             )

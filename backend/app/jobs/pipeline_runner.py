@@ -213,7 +213,7 @@ async def _run_pipeline(session, job: Job) -> None:
         await session.commit()
 
         try:
-            segs = await loop.run_in_executor(None, transcribe_chunk, chunk.path, model_name, first_lang)
+            segs = await loop.run_in_executor(None, transcribe_chunk, chunk.path, first_lang)
             chunk.transcript_json = serialize_segments(segs)
             chunk.status = "done"
         except ModelNotReady:
@@ -285,16 +285,11 @@ async def _run_translation_phase(session, job: Job, loop, source_lang: str) -> N
     import json as _json
     import dataclasses
     from app.pipeline.reassembler import reassemble as _reassemble_all
-    from app.pipeline.translator import select_translator_mode
     from app.pipeline.subtitle_generator import generate_srt, generate_vtt
     from app.pipeline.translation_orchestrator import run_translation_compute
     from app.models_db import TranslationChunk as TranslationChunkRow
 
     await _update_job(session, job, status="translating")
-
-    mode = job.translator_mode or select_translator_mode(job.filename, None)
-    job.translator_mode = mode
-    await session.commit()
 
     stt_result = await session.execute(
         select(Chunk).where(Chunk.job_id == job.id).order_by(Chunk.sequence)
@@ -311,7 +306,6 @@ async def _run_translation_phase(session, job: Job, loop, source_lang: str) -> N
     })
 
     source_segments = await loop.run_in_executor(None, _reassemble_all, stt_chunk_data)
-    is_video = mode == "vlm"
     job_dir = str(storage.job_dir(job.id))
 
     def _on_progress(done: int, total: int) -> None:
@@ -329,8 +323,8 @@ async def _run_translation_phase(session, job: Job, loop, source_lang: str) -> N
         None,
         lambda: run_translation_compute(
             source_segments, source_lang, job.target_language,
-            mode, job.enable_refinement, job.glossary_json or "",
-            job.video_path if is_video else None, job_dir,
+            job.enable_refinement, job.glossary_json or "",
+            job.video_path, job_dir,
             on_progress=_on_progress,
         ),
     )

@@ -60,7 +60,7 @@ def _ctx_to_dict(ctx: ContextBundle) -> dict:
 # ------------------------------------------------------------------ #
 
 class RemoteSTTProxy(BaseSTTModel):
-    """Proxy for qwen_lid, qwen3_asr, parakeet, whisper_turbo."""
+    """Proxy for qwen3_asr."""
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -93,7 +93,7 @@ class RemoteSTTProxy(BaseSTTModel):
 # ------------------------------------------------------------------ #
 
 class RemoteTranslatorProxy(BaseTranslator):
-    """Proxy for seamless_v2 and qwen2_5_vl."""
+    """Proxy for qwen2_5_vl."""
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -212,37 +212,6 @@ class RemoteTranslatorProxy(BaseTranslator):
         }
         resp = call_json("/v1/generate", json_data=payload)
         return resp.get("text", "")
-
-
-# ------------------------------------------------------------------ #
-# Remote forced-aligner proxy                                         #
-# ------------------------------------------------------------------ #
-
-class RemoteAlignerProxy:
-    """Proxy for forced_aligner."""
-
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-
-    def load(self) -> None:
-        pass
-
-    def align(self, audio_path: str, segments: List[TranscriptSegment]) -> List[TranscriptSegment]:
-        from app.ml.remote_client import call_multipart
-
-        payload = {
-            "model": self.model_name,
-            "segments": [_seg_to_dict(s) for s in segments],
-        }
-        with open(audio_path, "rb") as f:
-            resp = call_multipart(
-                "/v1/asr/align",
-                files={
-                    "audio": f,
-                    "payload": (None, json.dumps(payload), "application/json"),
-                },
-            )
-        return [_dict_to_seg(s) for s in resp.get("segments", [])]
 
 
 # ------------------------------------------------------------------ #

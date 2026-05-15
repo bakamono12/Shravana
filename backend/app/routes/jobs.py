@@ -69,9 +69,6 @@ async def translate_job(
         raise HTTPException(409, f"Job must be done before translating (status: {job.status})")
     if not is_supported(req.target_language):
         raise HTTPException(400, f"Unsupported target language '{req.target_language}'")
-    if req.translator_mode and req.translator_mode not in ("vlm", "audio"):
-        raise HTTPException(400, "translator_mode must be 'vlm' or 'audio'")
-
     job.translate = True
     job.target_language = req.target_language
     job.translator_mode = req.translator_mode
